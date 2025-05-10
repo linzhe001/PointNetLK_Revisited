@@ -1,4 +1,5 @@
-# PointNetLK_Revisited_org
+# PointNetLK_Revisited
+
 
 This repository is dedicated to comparing different Feature Extractors.  
 **Please focus on the `feature_extraction.py` file**, which provides the core implementation for all feature extractors.
