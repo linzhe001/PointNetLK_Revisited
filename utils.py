@@ -67,7 +67,7 @@ def transform(g, a):
     return b
 
 
-# so3
+# 注意：这里保留mat_so3函数，因为它在其它地方被使用
 def mat_so3(x):
     # x: [*, 3]
     # X: [*, 3, 3]
@@ -185,6 +185,7 @@ def mat_se3(x):
     return X.view(*(x.size()[0:-1]), 4, 4)
 
 
+# 注意：这里保留sinc1, sinc2, sinc3函数，因为它们在log_so3等函数中被使用
 def sinc1(t):
     """ sinc1: t -> sin(t)/t """
     e = 0.01
@@ -230,7 +231,7 @@ def sinc3(t):
     return r
 
 
-# functions for exp map
+# 注意：这里保留exp函数，因为它在其它地方被使用
 def exp(x):
     x_ = x.view(-1, 6)
     w, v = x_[:, 0:3], x_[:, 3:6]
@@ -281,110 +282,6 @@ class ExpMap(torch.autograd.Function):
 
         return grad_input
 
-
-# explicitly compute the analytical feature jacobian
-def feature_jac(M, A, Ax, BN, device):
-    # M, A, Ax, BN: list
-    A1, A2, A3 = A
-    M1, M2, M3 = M
-    Ax1, Ax2, Ax3 = Ax
-    BN1, BN2, BN3 = BN
-
-    # 1 x c_in x c_out x 1
-    A1 = (A1.T).detach().unsqueeze(-1)
-    A2 = (A2.T).detach().unsqueeze(-1)
-    A3 = (A3.T).detach().unsqueeze(-1)
-
-    # calculate gradient for batch normalization using autograd, 
-    # since the dimension is small, and the actual computation is complex.
-    # B x 1 x c_out x N
-    dBN1 = torch.autograd.grad(outputs=BN1, inputs=Ax1, grad_outputs=torch.ones(BN1.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-    dBN2 = torch.autograd.grad(outputs=BN2, inputs=Ax2, grad_outputs=torch.ones(BN2.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-    dBN3 = torch.autograd.grad(outputs=BN3, inputs=Ax3, grad_outputs=torch.ones(BN3.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-
-    # B x 1 x c_out x N
-    M1 = M1.detach().unsqueeze(1)
-    M2 = M2.detach().unsqueeze(1)
-    M3 = M3.detach().unsqueeze(1)
-
-    # 1. using *, naturally broadcast --> B x c_in x c_out x N
-    A1BN1M1 = A1 * dBN1 * M1
-    A2BN2M2 = A2 * dBN2 * M2
-    A3BN3M3 =  M3 * dBN3 * A3
-
-    # using torch.einsum()
-    A1BN1M1_A2BN2M2 = torch.einsum('ijkl,ikml->ijml', A1BN1M1, A2BN2M2)   # B x 3 x 64 x N
-    A2BN2M2_A3BN3M3 = torch.einsum('ijkl,ikml->ijml', A1BN1M1_A2BN2M2, A3BN3M3)   # B x 3 x K x N
-    
-    feat_jac = A2BN2M2_A3BN3M3
-
-    return feat_jac   # B x 3 x K x N
-
-
-# explicitly compute the analytical warp Jacobian
-def compute_warp_jac(t, xx, num_points):
-    b = xx.shape[0]
-    
-    warp_jac = torch.zeros(b, num_points, 3, 6).to(xx)
-    T = exp(t)
-    rotm = T[:, :3, :3]   # Bx3x3
-    warp_jac[..., 3:] = -rotm.transpose(1,2).unsqueeze(1).repeat(1, num_points, 1, 1)   # BxNx3x6
-    
-    x = xx[..., 0]
-    y = xx[..., 1]
-    z = xx[..., 2]
-    d03 = T[:, 1, 0].unsqueeze(1) * z - T[:, 2, 0].unsqueeze(1) * y   # BxN
-    d04 = -T[:, 0, 0].unsqueeze(1) * z + T[:, 2, 0].unsqueeze(1) * x
-    d05 = T[:, 0, 0].unsqueeze(1) * y - T[:, 1, 0].unsqueeze(1) * x
-    d13 = T[:, 1, 1].unsqueeze(1) * z - T[:, 2, 1].unsqueeze(1) * y
-    d14 = -T[:, 0, 1].unsqueeze(1) * z + T[:, 2, 1].unsqueeze(1) * x
-    d15 = T[:, 0, 1].unsqueeze(1) * y - T[:, 1, 1].unsqueeze(1) * x
-    d23 = T[:, 1, 2].unsqueeze(1) * z - T[:, 2, 2].unsqueeze(1) * y
-    d24 = -T[:, 0, 2].unsqueeze(1) * z + T[:, 2, 2].unsqueeze(1) * x
-    d25 = T[:, 0, 2].unsqueeze(1) * y - T[:, 1, 2].unsqueeze(1) * x
-    
-    d0 = torch.cat([d03.unsqueeze(-1), d04.unsqueeze(-1), d05.unsqueeze(-1)], -1)   # BxNx3
-    d1 = torch.cat([d13.unsqueeze(-1), d14.unsqueeze(-1), d15.unsqueeze(-1)], -1)
-    d2 = torch.cat([d23.unsqueeze(-1), d24.unsqueeze(-1), d25.unsqueeze(-1)], -1)
-    warp_jac[..., :3] = torch.cat([d0.unsqueeze(-2), d1.unsqueeze(-2), d2.unsqueeze(-2)], -2)
-
-    return warp_jac
-
-
-# explicitly compute the conditional warp Jacobian
-def cal_conditioned_warp_jacobian(voxel_coords):
-    # conditioned warp: see supplementary for detailed math.
-    #               --                                        --  ^-1
-    #               |   1  ,   0  ,   0  ,   0  ,   0  ,   0   |
-    #               |   0  ,   1  ,   0  ,   0  ,   0  ,   0   |
-    # xi_v / xi_g = |   0  ,   0  ,   1  ,   0  ,   0  ,   0   |
-    #               |   0  , -xi_6,  xi_5,   1  ,   0  ,   0   |
-    #               |  xi_6,   0  , -xi_4,   0  ,   1  ,   0   |
-    #               | -xi_5,  xi_4,   0  ,   0  ,   0  ,   1   |
-    #               --                                        --
-    
-    V = voxel_coords.shape[0]
-    conditioned_jac = torch.eye(6).repeat(V, 1, 1).to(voxel_coords)   # V x 6 x 6
-    trans_twist_mat_00 = torch.zeros(V, 1).to(voxel_coords)
-    trans_twist_mat_11 = torch.zeros(V, 1).to(voxel_coords)
-    trans_twist_mat_22 = torch.zeros(V, 1).to(voxel_coords)
-    trans_twist_mat_01 = -voxel_coords[:, 2].unsqueeze(1)
-    trans_twist_mat_02 = voxel_coords[:, 1].unsqueeze(1)
-    trans_twist_mat_10 = voxel_coords[:, 2].unsqueeze(1)
-    trans_twist_mat_12 = -voxel_coords[:, 0].unsqueeze(1)
-    trans_twist_mat_20 = -voxel_coords[:, 1].unsqueeze(1)
-    trans_twist_mat_21 = voxel_coords[:, 0].unsqueeze(1)
-    
-    trans_twist_mat_0 = torch.cat([trans_twist_mat_00, trans_twist_mat_01, trans_twist_mat_02], 1).reshape(-1, 3)
-    trans_twist_mat_1 = torch.cat([trans_twist_mat_10, trans_twist_mat_11, trans_twist_mat_12], 1).reshape(-1, 3)
-    trans_twist_mat_2 = torch.cat([trans_twist_mat_20, trans_twist_mat_21, trans_twist_mat_22], 1).reshape(-1, 3)
-    trans_twist_mat = torch.cat([trans_twist_mat_0, trans_twist_mat_1, trans_twist_mat_2], 1).reshape(-1, 3, 3)
-    conditioned_jac[:, 3:, :3] = trans_twist_mat   # V x 6 x 6
-    
-    conditioned_jac = torch.inverse(conditioned_jac).float()
-    
-    return conditioned_jac
-    
 
 # functions for testing metrics
 def test_metrics(rotations_gt, translation_gt, rotations_ab, translation_ab, filename):
@@ -459,4 +356,81 @@ def test_metrics(rotations_gt, translation_gt, rotations_ab, translation_ab, fil
             rot_rmse_ab_02, rot_mae_ab_02, trans_mse_ab_02, trans_rmse_ab_02, trans_mae_ab_02))
 
     return
+
+
+#### some basic functions ####
+# 从utils.py移植的函数：变形雅可比矩阵计算
+def compute_warp_jac(t, points, num_points):
+    """
+    计算变形雅可比矩阵
+    
+    参数:
+        t: 变换参数 [B,6]
+        points: 输入点云 [B,N,3]
+        num_points: 点云中的点数量
+        
+    返回:
+        变形雅可比矩阵 [B,N,3,6]
+    """
+    batch_size = points.shape[0]
+    
+    warp_jac = torch.zeros(batch_size, num_points, 3, 6).to(points)
+    T = exp(t)
+    rotm = T[:, :3, :3]   # Bx3x3
+    warp_jac[..., 3:] = -rotm.transpose(1,2).unsqueeze(1).repeat(1, num_points, 1, 1)   # BxNx3x6
+    
+    x = points[..., 0]
+    y = points[..., 1]
+    z = points[..., 2]
+    d03 = T[:, 1, 0].unsqueeze(1) * z - T[:, 2, 0].unsqueeze(1) * y   # BxN
+    d04 = -T[:, 0, 0].unsqueeze(1) * z + T[:, 2, 0].unsqueeze(1) * x
+    d05 = T[:, 0, 0].unsqueeze(1) * y - T[:, 1, 0].unsqueeze(1) * x
+    d13 = T[:, 1, 1].unsqueeze(1) * z - T[:, 2, 1].unsqueeze(1) * y
+    d14 = -T[:, 0, 1].unsqueeze(1) * z + T[:, 2, 1].unsqueeze(1) * x
+    d15 = T[:, 0, 1].unsqueeze(1) * y - T[:, 1, 1].unsqueeze(1) * x
+    d23 = T[:, 1, 2].unsqueeze(1) * z - T[:, 2, 2].unsqueeze(1) * y
+    d24 = -T[:, 0, 2].unsqueeze(1) * z + T[:, 2, 2].unsqueeze(1) * x
+    d25 = T[:, 0, 2].unsqueeze(1) * y - T[:, 1, 2].unsqueeze(1) * x
+    
+    d0 = torch.cat([d03.unsqueeze(-1), d04.unsqueeze(-1), d05.unsqueeze(-1)], -1)   # BxNx3
+    d1 = torch.cat([d13.unsqueeze(-1), d14.unsqueeze(-1), d15.unsqueeze(-1)], -1)
+    d2 = torch.cat([d23.unsqueeze(-1), d24.unsqueeze(-1), d25.unsqueeze(-1)], -1)
+    warp_jac[..., :3] = torch.cat([d0.unsqueeze(-2), d1.unsqueeze(-2), d2.unsqueeze(-2)], -2)
+
+    return warp_jac
+
+
+# 从utils.py移植的函数：条件变形雅可比矩阵计算
+def cal_conditioned_warp_jacobian(voxel_coords):
+    """
+    计算条件变形雅可比矩阵（用于真实数据）
+    
+    参数:
+        voxel_coords: 体素坐标
+        
+    返回:
+        条件变形雅可比矩阵
+    """
+    # 计算体素坐标与全局坐标的变换矩阵
+    V = voxel_coords.shape[0]
+    conditioned_jac = torch.eye(6).repeat(V, 1, 1).to(voxel_coords)   # V x 6 x 6
+    trans_twist_mat_00 = torch.zeros(V, 1).to(voxel_coords)
+    trans_twist_mat_11 = torch.zeros(V, 1).to(voxel_coords)
+    trans_twist_mat_22 = torch.zeros(V, 1).to(voxel_coords)
+    trans_twist_mat_01 = -voxel_coords[:, 2].unsqueeze(1)
+    trans_twist_mat_02 = voxel_coords[:, 1].unsqueeze(1)
+    trans_twist_mat_10 = voxel_coords[:, 2].unsqueeze(1)
+    trans_twist_mat_12 = -voxel_coords[:, 0].unsqueeze(1)
+    trans_twist_mat_20 = -voxel_coords[:, 1].unsqueeze(1)
+    trans_twist_mat_21 = voxel_coords[:, 0].unsqueeze(1)
+    
+    trans_twist_mat_0 = torch.cat([trans_twist_mat_00, trans_twist_mat_01, trans_twist_mat_02], 1).reshape(-1, 3)
+    trans_twist_mat_1 = torch.cat([trans_twist_mat_10, trans_twist_mat_11, trans_twist_mat_12], 1).reshape(-1, 3)
+    trans_twist_mat_2 = torch.cat([trans_twist_mat_20, trans_twist_mat_21, trans_twist_mat_22], 1).reshape(-1, 3)
+    trans_twist_mat = torch.cat([trans_twist_mat_0, trans_twist_mat_1, trans_twist_mat_2], 1).reshape(-1, 3, 3)
+    conditioned_jac[:, 3:, :3] = trans_twist_mat   # V x 6 x 6
+    
+    conditioned_jac = torch.inverse(conditioned_jac).float()
+    
+    return conditioned_jac
 

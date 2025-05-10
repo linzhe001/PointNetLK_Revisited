@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 import utils
+from feature_extraction import FeatureExtractor
 
 
 def mlp_layers(nch_input, nch_layers, b_shared=True, bn_momentum=0.1, dropout=0.0):
@@ -47,62 +48,20 @@ def symfn_max(x):
     return a
 
 
-class Pointnet_Features(torch.nn.Module):
-    def __init__(self, dim_k=1024):
-        super().__init__()
-        self.mlp1 = MLPNet(3, [64], b_shared=True).layers
-        self.mlp2 = MLPNet(64, [128], b_shared=True).layers
-        self.mlp3 = MLPNet(128, [dim_k], b_shared=True).layers
-
-    def forward(self, points, iter):
-        """ points -> features
-            [B, N, 3] -> [B, K]
-        """
-        x = points.transpose(1, 2) # [B, 3, N]
-        if iter == -1:
-            x = self.mlp1[0](x)
-            A1_x = x
-            x = self.mlp1[1](x)
-            bn1_x = x
-            x = self.mlp1[2](x)
-            M1 = (x > 0).type(torch.float)
-            
-            x = self.mlp2[0](x)
-            A2_x = x
-            x = self.mlp2[1](x)
-            bn2_x = x
-            x = self.mlp2[2](x)
-            M2 = (x > 0).type(torch.float)
-            
-            x = self.mlp3[0](x)
-            A3_x = x
-            x = self.mlp3[1](x)
-            bn3_x = x
-            x = self.mlp3[2](x)
-            M3 = (x > 0).type(torch.float)
-            max_idx = torch.max(x, -1)[-1]
-            x = torch.nn.functional.max_pool1d(x, x.size(-1))
-            x = x.view(x.size(0), -1)
-
-            # extract weights....
-            A1 = self.mlp1[0].weight
-            A2 = self.mlp2[0].weight
-            A3 = self.mlp3[0].weight
-
-            return x, [M1, M2, M3], [A1, A2, A3], [A1_x, A2_x, A3_x], [bn1_x, bn2_x, bn3_x], max_idx
-        else:
-            x = self.mlp1(x)
-            x = self.mlp2(x)
-            x = self.mlp3(x)
-            x = torch.nn.functional.max_pool1d(x, x.size(-1))
-            x = x.view(x.size(0), -1)
-
-            return x
-
-
 class AnalyticalPointNetLK(torch.nn.Module):
     def __init__(self, ptnet, device):
+        """
+        初始化AnalyticalPointNetLK模型
+        
+        参数:
+            ptnet: 特征提取器实例，必须继承自FeatureExtractor
+            device: 计算设备
+        """
         super().__init__()
+        
+        # 确保ptnet是FeatureExtractor的子类
+        assert isinstance(ptnet, FeatureExtractor), "特征提取器必须继承自FeatureExtractor"
+        
         self.ptnet = ptnet
         self.device = device
         self.inverse = utils.InvMatrix.apply
@@ -220,46 +179,21 @@ class AnalyticalPointNetLK(torch.nn.Module):
         return dg.matmul(g.float())
 
     def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic'):
-        batch_size = p0.shape[0]
-
-        # 1. get "warp Jacobian", warp => Identity matrix, can be pre-computed
-        g_ = torch.zeros(batch_size, 6).to(self.device)
-        warp_jac = utils.compute_warp_jac(g_, p0, num_points)   # B x N x 3 x 6
-        
-        # 2. explicitly compute "feature gradient"
-        feature_j = utils.feature_jac(
-            Mask_fn, A_fn, Ax_fn, BN_fn, self.device).to(self.device)
-        feature_j = feature_j.permute(0, 3, 1, 2)   # B x N x 6 x K
-        
-        # 3. compose to get final Jacobian
-        J_ = torch.einsum('ijkl,ijkm->ijlm', feature_j, warp_jac)   # B x N x K x 6, K=1024
-        
-        # 4. max pooling according to network
-        dim_k = J_.shape[2]
-        jac_max = J_.permute(0, 2, 1, 3)   # B x K x N x 6
-        jac_max_ = []
-        
-        for i in range(batch_size):
-            jac_max_t = jac_max[i, np.arange(dim_k), max_idx[i]]
-            jac_max_.append(jac_max_t)
-        jac_max_ = torch.cat(jac_max_)
-        J_ = jac_max_.reshape(batch_size, dim_k, 6)   # B x K x 6
-        if len(J_.size()) < 3:
-            J = J_.unsqueeze(0)
-        else:
-            J = J_
-        
-        if mode == 'test' and data_type == 'real':
-            J_ = J_.permute(1, 0, 2).reshape(dim_k, -1)   # K x (V6)
-            
-            # 1. explicit expression for the conditioned warp of 6 twist parameters
-            # V x 6 x 6, using the difference between the local points mean and global points mean
-            warp_condition = utils.cal_conditioned_warp_jacobian(voxel_coords_diff)   
-            warp_condition = warp_condition.permute(0,2,1).reshape(-1, 6)   # (V6) x 6
-
-            J = torch.einsum('ij,jk->ik', J_, warp_condition).unsqueeze(0)   # 1 X K X 6
-            
-        return J
+        """
+        调用特征提取器的get_jacobian方法计算雅可比矩阵
+        """
+        return self.ptnet.get_jacobian(
+            p0=p0, 
+            mask_fn=Mask_fn, 
+            a_fn=A_fn, 
+            ax_fn=Ax_fn, 
+            bn_fn=BN_fn, 
+            max_idx=max_idx, 
+            mode=mode,
+            voxel_coords_diff=voxel_coords_diff,
+            data_type=data_type,
+            num_points=num_points
+        )
 
     def iclk_new(self, g0, p0, p1, maxiter, xtol, mode, voxel_coords_diff=None, data_type='synthetic', num_random_points=100):
         training = self.ptnet.training

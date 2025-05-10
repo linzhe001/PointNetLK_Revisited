@@ -10,6 +10,7 @@ from open3d.web_visualizer import draw   # for notebook
 
 import model
 import utils
+from feature_extraction import Pointnet_Features, Mamba3D_Features
 
 
 LOGGER = logging.getLogger(__name__)
@@ -31,11 +32,32 @@ class TrainerAnalyticalPointNetLK:
         self.filename = args.outfile
         
     def create_features(self):
+        """
+        创建特征提取网络
+        
+        返回:
+            特征提取器实例
+        """
         if self.embedding == 'pointnet':
-            ptnet = model.Pointnet_Features(dim_k=self.dim_k)
+            ptnet = Pointnet_Features(dim_k=self.dim_k)
+        elif self.embedding == '3dmamba_v1':
+            ptnet = Mamba3D_Features(dim_k=self.dim_k)
+        # 可以在这里添加其他特征提取器的创建
+        else:
+            raise ValueError(f"未知的特征提取器类型: {self.embedding}")
+            
         return ptnet.float()
 
     def create_from_pointnet_features(self, ptnet):
+        """
+        从特征提取器创建PointNetLK模型
+        
+        参数:
+            ptnet: 特征提取器实例
+            
+        返回:
+            AnalyticalPointNetLK模型实例
+        """
         return model.AnalyticalPointNetLK(ptnet, self.device)
 
     def create_model(self):
