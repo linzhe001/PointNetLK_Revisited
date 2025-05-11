@@ -281,6 +281,8 @@ class AnalyticalPointNetLK(torch.nn.Module):
         # compute psuedo inverse of the Jacobian to solve delta(xi)
         Jt = J.transpose(1, 2)   # [B, 6, K]
         H = Jt.bmm(J)   # [B, 6, 6]
+        # 添加一个小的正则化项到H矩阵的对角线上，确保其可逆
+        H = H + torch.eye(H.size(-1), device=H.device) * 1e-4
         B = self.inverse(H)
         pinv = B.bmm(Jt)   # [B, 6, K]
         

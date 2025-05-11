@@ -549,7 +549,10 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     dBN3 = torch.autograd.grad(outputs=BN3, inputs=Ax3, grad_outputs=torch.ones(BN3.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     bn_grad_end = time.time()
     #print(f"BN梯度计算耗时: {bn_grad_end - bn_grad_start:.4f} 秒")
-    
+        # 在使用前处理BN梯度
+    dBN1[torch.abs(dBN1) < 1e-10] = 0.0
+    dBN2[torch.abs(dBN2) < 1e-10] = 0.0
+    dBN3[torch.abs(dBN3) < 1e-10] = 0.0
     # B x 1 x c_out x N
     M1 = M1.detach().unsqueeze(1)
     M2 = M2.detach().unsqueeze(1)
@@ -563,7 +566,11 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     dMamba3 = torch.autograd.grad(outputs=mamba3_out, inputs=mamba3_in, grad_outputs=torch.ones(mamba3_out.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     mamba_grad_end = time.time()
     #print(f"Mamba梯度计算耗时: {mamba_grad_end - mamba_grad_start:.4f} 秒")
-
+    # 在计算梯度后添加
+    # 避免极小梯度值
+    dMamba1[torch.abs(dMamba1) < 1e-10] = 0.0
+    dMamba2[torch.abs(dMamba2) < 1e-10] = 0.0
+    dMamba3[torch.abs(dMamba3) < 1e-10] = 0.0
     # 使用广播计算，包含Mamba层 --> B x c_in x c_out x N
     comp_start = time.time()
     A1BN1M1 = A1 * (dBN1 * M1 * dMamba1)
