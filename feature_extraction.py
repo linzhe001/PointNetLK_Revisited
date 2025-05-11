@@ -404,7 +404,9 @@ class Mamba3D_Features(FeatureExtractor):
             x = self.mlp1_layers[1](x)
             bn1_x = x
             x = self.mlp1_layers[2](x)
+            mamba1_in = x  # 保存Mamba层输入
             x = self.mlp1_layers[3](x)
+            mamba1_out = x  # 保存Mamba层输出
             M1 = (x > 0).float()
             
             # MLP2
@@ -413,7 +415,9 @@ class Mamba3D_Features(FeatureExtractor):
             x = self.mlp2_layers[1](x)
             bn2_x = x
             x = self.mlp2_layers[2](x)
+            mamba2_in = x  # 保存Mamba层输入
             x = self.mlp2_layers[3](x)
+            mamba2_out = x # 保存Mamba层输出
             M2 = (x > 0).float()
             
             # MLP3
@@ -422,7 +426,9 @@ class Mamba3D_Features(FeatureExtractor):
             x = self.mlp3_layers[1](x)
             bn3_x = x
             x = self.mlp3_layers[2](x)
+            mamba3_in = x # 保存Mamba层输入
             x = self.mlp3_layers[3](x)
+            mamba3_out = x  # 保存Mamba层输出
             M3 = (x > 0).float()
             
             # 全局最大池化
@@ -435,7 +441,8 @@ class Mamba3D_Features(FeatureExtractor):
             A2 = self.mlp2_layers[0].weight
             A3 = self.mlp3_layers[0].weight
             
-            return x, [M1, M2, M3], [A1, A2, A3], [A1_x, A2_x, A3_x], [bn1_x, bn2_x, bn3_x], max_idx
+            # 返回增加了Mamba层的输入输出
+            return x, [M1, M2, M3], [A1, A2, A3], [A1_x, A2_x, A3_x], [bn1_x, bn2_x, bn3_x], max_idx, [mamba1_in, mamba2_in, mamba3_in], [mamba1_out, mamba2_out, mamba3_out]
         else:  # 标准前向传播
             x = self.mlp1(x)
             x = self.mlp2(x)
@@ -444,12 +451,23 @@ class Mamba3D_Features(FeatureExtractor):
             x = x.view(x.size(0), -1)
             return x
     
-    def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mode="train", 
-                     voxel_coords_diff=None, data_type='synthetic', num_points=None):
+    def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mamba_in=None, mamba_out=None, mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None):
         """
         计算特征提取的雅可比矩阵
         
-        参数与基类相同，但实现方式需要匹配Mamba3D网络结构
+        参数:
+            p0: 输入点云 [B,N,3]
+            mask_fn, a_fn, ax_fn, bn_fn: 中间层输出
+            max_idx: 最大池化索引
+            mamba_in: Mamba层的输入列表 [mamba1_in, mamba2_in, mamba3_in]
+            mamba_out: Mamba层的输出列表 [mamba1_out, mamba2_out, mamba3_out]
+            mode: 训练或测试模式
+            voxel_coords_diff: 体素坐标差异（用于真实数据）
+            data_type: 数据类型（'synthetic'或'real'）
+            num_points: 点云中的点数量
+            
+        返回:
+            雅可比矩阵 [B,K,6]
         """
         if num_points is None:
             num_points = p0.shape[1]
@@ -457,18 +475,18 @@ class Mamba3D_Features(FeatureExtractor):
         dim_k = self.dim_k
         device = p0.device
         
-        # 1. 计算变形雅可比矩阵 - 与原始实现相同
+        # 1. 计算变形雅可比矩阵
         g_ = torch.zeros(batch_size, 6).to(device)
         warp_jac = utils.compute_warp_jac(g_, p0, num_points)   # B x N x 3 x 6
         
-        # 2. 计算特征雅可比矩阵 - 需要处理Mamba3D结构
-        feature_j = feature_jac_mamba3dv1(mask_fn, a_fn, ax_fn, bn_fn, device).to(device)
+        # 2. 计算特征雅可比矩阵
+        feature_j = feature_jac_mamba3dv1(mask_fn, a_fn, ax_fn, bn_fn, mamba_in, mamba_out, device).to(device)
         feature_j = feature_j.permute(0, 3, 1, 2)   # B x N x 6 x K
         
-        # 3. 组合得到最终雅可比矩阵 - 与原始实现相同
+        # 3. 组合得到最终雅可比矩阵
         J_ = torch.einsum('ijkl,ijkm->ijlm', feature_j, warp_jac)   # B x N x K x 6
         
-        # 4. 根据最大池化索引进行处理 - 与原始实现相同
+        # 4. 根据最大池化索引进行处理
         jac_max = J_.permute(0, 2, 1, 3)   # B x K x N x 6
         jac_max_ = []
         
@@ -483,59 +501,91 @@ class Mamba3D_Features(FeatureExtractor):
         else:
             J = J_
         
-        # 处理真实数据的特殊情况 - 与原始实现相同
+        # 处理真实数据的特殊情况
         if mode == 'test' and data_type == 'real':
             J_ = J_.permute(1, 0, 2).reshape(dim_k, -1)   # K x (V6)
             warp_condition = utils.cal_conditioned_warp_jacobian(voxel_coords_diff)   # V x 6 x 6
             warp_condition = warp_condition.permute(0,2,1).reshape(-1, 6)   # (V6) x 6
             J = torch.einsum('ij,jk->ik', J_, warp_condition).unsqueeze(0)   # 1 X K X 6
             
-        return J 
-    
+        return J
+
 
 # 特征雅可比矩阵计算 for mamba3d
-def feature_jac_mamba3dv1(M, A, Ax, BN, device):
+def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     """
-    计算特征雅可比矩阵
+    计算特征雅可比矩阵，包含Mamba层的处理
     
     参数:
         M, A, Ax, BN: 中间层输出列表
+        mamba_in: Mamba层的输入列表 [mamba1_in, mamba2_in, mamba3_in]
+        mamba_out: Mamba层的输出列表 [mamba1_out, mamba2_out, mamba3_out]
         device: 计算设备
         
     返回:
         特征雅可比矩阵
     """
+    import time
+    total_start = time.time()
+    
     # 解包输入列表
     A1, A2, A3 = A
     M1, M2, M3 = M
     Ax1, Ax2, Ax3 = Ax
     BN1, BN2, BN3 = BN
+    
+    # 解包Mamba层输入输出
+    mamba1_in, mamba2_in, mamba3_in = mamba_in
+    mamba1_out, mamba2_out, mamba3_out = mamba_out
 
     # 1 x c_in x c_out x 1
+    prep_start = time.time()
     A1 = (A1.T).detach().unsqueeze(-1)
     A2 = (A2.T).detach().unsqueeze(-1)
     A3 = (A3.T).detach().unsqueeze(-1)
+    prep_end = time.time()
+    print(f"准备张量耗时: {prep_end - prep_start:.4f} 秒")
 
     # 使用自动微分计算批量归一化的梯度
     # B x 1 x c_out x N
+    bn_grad_start = time.time()
     dBN1 = torch.autograd.grad(outputs=BN1, inputs=Ax1, grad_outputs=torch.ones(BN1.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     dBN2 = torch.autograd.grad(outputs=BN2, inputs=Ax2, grad_outputs=torch.ones(BN2.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     dBN3 = torch.autograd.grad(outputs=BN3, inputs=Ax3, grad_outputs=torch.ones(BN3.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-
+    bn_grad_end = time.time()
+    print(f"BN梯度计算耗时: {bn_grad_end - bn_grad_start:.4f} 秒")
+    
     # B x 1 x c_out x N
     M1 = M1.detach().unsqueeze(1)
     M2 = M2.detach().unsqueeze(1)
     M3 = M3.detach().unsqueeze(1)
 
-    # 使用广播计算 --> B x c_in x c_out x N
-    A1BN1M1 = A1 * dBN1 * M1
-    A2BN2M2 = A2 * dBN2 * M2
-    A3BN3M3 = M3 * dBN3 * A3
+    # 使用自动微分计算Mamba层的梯度
+    # B x 1 x c_out x N
+    mamba_grad_start = time.time()
+    dMamba1 = torch.autograd.grad(outputs=mamba1_out, inputs=mamba1_in, grad_outputs=torch.ones(mamba1_out.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    dMamba2 = torch.autograd.grad(outputs=mamba2_out, inputs=mamba2_in, grad_outputs=torch.ones(mamba2_out.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    dMamba3 = torch.autograd.grad(outputs=mamba3_out, inputs=mamba3_in, grad_outputs=torch.ones(mamba3_out.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    mamba_grad_end = time.time()
+    print(f"Mamba梯度计算耗时: {mamba_grad_end - mamba_grad_start:.4f} 秒")
+
+    # 使用广播计算，包含Mamba层 --> B x c_in x c_out x N
+    comp_start = time.time()
+    A1BN1M1 = A1 * (dBN1 * M1 * dMamba1)
+    A2BN2M2 = A2 * (dBN2 * M2 * dMamba2)
+    A3BN3M3 = (dMamba3 * M3 * dBN3) * A3
+    comp_mid = time.time()
+    print(f"中间计算耗时: {comp_mid - comp_start:.4f} 秒")
 
     # 使用einsum组合
     A1BN1M1_A2BN2M2 = torch.einsum('ijkl,ikml->ijml', A1BN1M1, A2BN2M2)   # B x 3 x 64 x N
     A2BN2M2_A3BN3M3 = torch.einsum('ijkl,ikml->ijml', A1BN1M1_A2BN2M2, A3BN3M3)   # B x 3 x K x N
     
     feat_jac = A2BN2M2_A3BN3M3
-
-    return feat_jac   # B x 3 x K x N
+    comp_end = time.time()
+    print(f"einsum计算耗时: {comp_end - comp_mid:.4f} 秒")
+    
+    total_end = time.time()
+    print(f"雅可比矩阵总计算耗时: {total_end - total_start:.4f} 秒")
+    
+    return feat_jac # B x 3 x K x N
