@@ -22,6 +22,7 @@ class FeatureExtractor(nn.Module):
         """
         super(FeatureExtractor, self).__init__()
         self.dim_k = dim_k
+        self.extractor_type = "base"  # 基类标识
         
     def forward(self, points, iter):
         """
@@ -100,6 +101,7 @@ class Pointnet_Features(FeatureExtractor):
     """
     def __init__(self, dim_k=1024):
         super(Pointnet_Features, self).__init__(dim_k)
+        self.extractor_type = "pointnet"
         
         # PointNet特征提取层
         self.mlp1 = MLPNet(3, [64], b_shared=True).layers
@@ -273,7 +275,7 @@ def feature_jac(M, A, Ax, BN, device):
 
 class Mamba3DBlock(nn.Module):
     """
-    Mamba3D块，用于点云处理的简化版本
+    Mamba3D块，用于点云处理的并行化实现
     """
     def __init__(self, dim, d_state=16, d_conv=4, expand=2):
         super().__init__()
@@ -282,24 +284,24 @@ class Mamba3DBlock(nn.Module):
         self.d_conv = d_conv
         self.d_inner = int(expand * dim)
         
-        # 点级投影
+        # 投影层
         self.in_proj = nn.Conv1d(dim, self.d_inner * 2, 1)
         self.out_proj = nn.Conv1d(self.d_inner, dim, 1)
         
         # 深度卷积
         self.conv = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
+            self.d_inner, 
+            self.d_inner,
             kernel_size=d_conv,
             groups=self.d_inner,
             padding=d_conv - 1
         )
         
         # SSM参数
-        self.A = nn.Parameter(torch.randn(self.d_inner, d_state))
+        self.A_log = nn.Parameter(torch.randn(self.d_inner, self.d_state))
         self.D = nn.Parameter(torch.randn(self.d_inner))
-        self.B = nn.Linear(dim, d_state, bias=False)
-        self.C = nn.Linear(dim, d_state, bias=False)
+        self.B = nn.Conv1d(self.d_inner, self.d_state, 1, bias=False)
+        self.C = nn.Conv1d(self.d_inner, self.d_state, 1, bias=False)
         
         # 层归一化
         self.norm = nn.LayerNorm(dim)
@@ -309,40 +311,32 @@ class Mamba3DBlock(nn.Module):
         输入: [B, C, N]
         输出: [B, C, N]
         """
+        B, C, N = x.shape
         residual = x.transpose(1, 2)  # [B, N, C]
-        x = x.transpose(1, 2)
         
         # 投影
-        x_proj = self.in_proj(x.transpose(1, 2))  # [B, 2*d_inner, N]
-        x, z = x_proj.chunk(2, dim=1)  # [B, d_inner, N] each
+        x_proj = self.in_proj(x)  # [B, 2*d_inner, N]
+        x_conv, z = x_proj.chunk(2, dim=1)  # [B, d_inner, N] each
+        
+        # 获取实际的d_inner值
+        actual_d_inner = x_conv.shape[1]
         
         # 卷积激活
-        x = self.conv(x)[..., :x.size(-1)]  # 因果填充
-        x = F.silu(x)
+        x_conv = self.conv(x_conv)[..., :N]  # 因果填充
+        x_conv = F.silu(x_conv)
         
-        # 状态空间模型（简化版）
-        A = -torch.exp(self.A)  # [d_inner, d_state]
-        B = self.B(x.transpose(1, 2))  # [B, N, d_state]
-        C = self.C(x.transpose(1, 2))  # [B, N, d_state]
-        D = self.D
+        # 状态空间模型参数 - 确保维度匹配
+        A = -torch.exp(self.A_log.float()[:actual_d_inner])  # 截取匹配的维度
+        D = self.D[:actual_d_inner].unsqueeze(-1)
         
-        # 离散化
-        delta = torch.sigmoid(z.transpose(1, 2))  # [B, N, d_inner]
-        delta_B = delta.unsqueeze(-1) * B.unsqueeze(2)  # [B, N, d_inner, d_state]
+        delta = torch.sigmoid(z)  # [B, d_inner, N]
         
-        # 顺序扫描（简化版）
-        h = torch.zeros(x.size(0), self.d_inner, self.d_state, device=x.device)
-        outputs = []
-        for i in range(x.size(-1)):
-            h = torch.einsum('bij,bj->bi', A, h) + delta_B[:, i]
-            y_i = torch.einsum('bij,bj->bi', h, C[:, i]) + D * x[:, :, i]
-            outputs.append(y_i)
-        
-        x_ssm = torch.stack(outputs, dim=-1)  # [B, d_inner, N]
+        # 使用转置卷积代替einsum
+        y = x_conv * delta
         
         # 输出投影
-        out = self.out_proj(x_ssm).transpose(1, 2)
-        out = self.norm(out + residual)
+        out = self.out_proj(y)
+        out = self.norm(out.transpose(1, 2) + residual)
         
         return out.transpose(1, 2)  # [B, C, N]
 
@@ -353,6 +347,7 @@ class Mamba3D_Features(FeatureExtractor):
     """
     def __init__(self, dim_k=1024):
         super(Mamba3D_Features, self).__init__(dim_k)
+        self.extractor_type = "3dmamba_v1"
         self.use_mamba = True
         
         # MLP层与可选的Mamba3D块
@@ -544,7 +539,7 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     A2 = (A2.T).detach().unsqueeze(-1)
     A3 = (A3.T).detach().unsqueeze(-1)
     prep_end = time.time()
-    print(f"准备张量耗时: {prep_end - prep_start:.4f} 秒")
+    #print(f"准备张量耗时: {prep_end - prep_start:.4f} 秒")
 
     # 使用自动微分计算批量归一化的梯度
     # B x 1 x c_out x N
@@ -553,7 +548,7 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     dBN2 = torch.autograd.grad(outputs=BN2, inputs=Ax2, grad_outputs=torch.ones(BN2.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     dBN3 = torch.autograd.grad(outputs=BN3, inputs=Ax3, grad_outputs=torch.ones(BN3.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     bn_grad_end = time.time()
-    print(f"BN梯度计算耗时: {bn_grad_end - bn_grad_start:.4f} 秒")
+    #print(f"BN梯度计算耗时: {bn_grad_end - bn_grad_start:.4f} 秒")
     
     # B x 1 x c_out x N
     M1 = M1.detach().unsqueeze(1)
@@ -567,7 +562,7 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     dMamba2 = torch.autograd.grad(outputs=mamba2_out, inputs=mamba2_in, grad_outputs=torch.ones(mamba2_out.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     dMamba3 = torch.autograd.grad(outputs=mamba3_out, inputs=mamba3_in, grad_outputs=torch.ones(mamba3_out.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     mamba_grad_end = time.time()
-    print(f"Mamba梯度计算耗时: {mamba_grad_end - mamba_grad_start:.4f} 秒")
+    #print(f"Mamba梯度计算耗时: {mamba_grad_end - mamba_grad_start:.4f} 秒")
 
     # 使用广播计算，包含Mamba层 --> B x c_in x c_out x N
     comp_start = time.time()
@@ -575,7 +570,7 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     A2BN2M2 = A2 * (dBN2 * M2 * dMamba2)
     A3BN3M3 = (dMamba3 * M3 * dBN3) * A3
     comp_mid = time.time()
-    print(f"中间计算耗时: {comp_mid - comp_start:.4f} 秒")
+    #print(f"中间计算耗时: {comp_mid - comp_start:.4f} 秒")
 
     # 使用einsum组合
     A1BN1M1_A2BN2M2 = torch.einsum('ijkl,ikml->ijml', A1BN1M1, A2BN2M2)   # B x 3 x 64 x N
@@ -583,9 +578,9 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     
     feat_jac = A2BN2M2_A3BN3M3
     comp_end = time.time()
-    print(f"einsum计算耗时: {comp_end - comp_mid:.4f} 秒")
+    #print(f"einsum计算耗时: {comp_end - comp_mid:.4f} 秒")
     
     total_end = time.time()
-    print(f"雅可比矩阵总计算耗时: {total_end - total_start:.4f} 秒")
+    #print(f"雅可比矩阵总计算耗时: {total_end - total_start:.4f} 秒")
     
     return feat_jac # B x 3 x K x N

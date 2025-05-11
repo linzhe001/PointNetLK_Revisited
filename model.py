@@ -71,6 +71,9 @@ class AnalyticalPointNetLK(torch.nn.Module):
         self.step_train = 0
         self.step_test = 0
 
+        # 识别特征提取器类型
+        self.extractor_type = self.ptnet.extractor_type
+
         # results
         self.last_err = None
         self.prev_r = None
@@ -178,22 +181,42 @@ class AnalyticalPointNetLK(torch.nn.Module):
         dg = self.exp(dx)
         return dg.matmul(g.float())
 
-    def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic'):
+    def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic', mamba_in=None, mamba_out=None):
         """
         调用特征提取器的get_jacobian方法计算雅可比矩阵
         """
-        return self.ptnet.get_jacobian(
-            p0=p0, 
-            mask_fn=Mask_fn, 
-            a_fn=A_fn, 
-            ax_fn=Ax_fn, 
-            bn_fn=BN_fn, 
-            max_idx=max_idx, 
-            mode=mode,
-            voxel_coords_diff=voxel_coords_diff,
-            data_type=data_type,
-            num_points=num_points
-        )
+        if self.extractor_type == "pointnet":
+            # 原始PointNet特征提取器
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points
+            )
+        elif self.extractor_type == "3dmamba_v1":
+            # Mamba3D特征提取器需要额外的参数
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mamba_in=mamba_in,
+                mamba_out=mamba_out,
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points
+            )
+        else:
+            raise ValueError(f"不支持的特征提取器类型: {self.extractor_type}")
 
     def iclk_new(self, g0, p0, p1, maxiter, xtol, mode, voxel_coords_diff=None, data_type='synthetic', num_random_points=100):
         training = self.ptnet.training
@@ -224,20 +247,36 @@ class AnalyticalPointNetLK(torch.nn.Module):
                 f0 = self.ptnet(p0[:, data_sampler[i], :], i)
                 f1 = self.ptnet(p1[:, data_sampler[i], :], i)
                 
-        # ANCHOR: compute the Jacobian matrix
+        # 计算雅可比矩阵所需的中间输出
         if mode == 'test':
-            f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = self.ptnet(p0, -1)
-            J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
-                            num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, data_type=data_type)   # B x N x K x D, K=1024, D=3 or 6
+            if self.extractor_type == "pointnet":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type)
+            elif self.extractor_type == "3dmamba_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, mamba_in, mamba_out = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type, mamba_in=mamba_in, mamba_out=mamba_out)
         else:
             if num_points >= num_random_points:
                 random_idx = np.random.choice(num_points, num_random_points, replace=False)
             else:
                 random_idx = np.random.choice(num_points, num_random_points, replace=True)
             random_points = p0[:, random_idx]
-            f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = self.ptnet(random_points, -1)
-            J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
-                             num_random_points, random_points, mode)   # B x N x K x 6, K=1024
+            
+            if self.extractor_type == "pointnet":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
+                             num_random_points, random_points, mode, 
+                             voxel_coords_diff=None, data_type=data_type)
+            elif self.extractor_type == "3dmamba_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, mamba_in, mamba_out = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
+                             num_random_points, random_points, mode, 
+                             voxel_coords_diff=None, data_type=data_type,
+                             mamba_in=mamba_in, mamba_out=mamba_out)
 
         # compute psuedo inverse of the Jacobian to solve delta(xi)
         Jt = J.transpose(1, 2)   # [B, 6, K]
