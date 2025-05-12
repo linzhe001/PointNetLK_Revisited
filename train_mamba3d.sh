@@ -9,9 +9,11 @@ NUM_POINTS=1000
 NUM_RANDOM_POINTS=100
 MAG=0.8
 BATCH_SIZE=32
-MAX_EPOCHS=200
-LEARNING_RATE=1e-6
+MAX_EPOCHS=100
+LEARNING_RATE=1e-5 # 调整初始学习率
 DECAY_RATE=1e-4
+WARMUP_EPOCHS=5     # 学习率预热轮数
+MIN_LR=1e-8       # 余弦退火最小学习率
 EMBEDDING="3dmamba_v1"  # 使用Mamba3D特征提取器
 DIM_K=1024
 MAX_ITER=10
@@ -30,6 +32,8 @@ python train.py \
     --max_epochs ${MAX_EPOCHS} \
     --lr ${LEARNING_RATE} \
     --decay_rate ${DECAY_RATE} \
+    --warmup_epochs ${WARMUP_EPOCHS} \
+    --min_lr ${MIN_LR} \
     --embedding ${EMBEDDING} \
     --dim_k ${DIM_K} \
     --max_iter ${MAX_ITER} \

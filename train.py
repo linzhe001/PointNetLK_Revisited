@@ -77,6 +77,12 @@ def options(argv=None):
     parser.add_argument('--pretrained', default='', type=str,
                         metavar='PATH', help='path to pretrained model file')
 
+    # settings for learning rate warmup
+    parser.add_argument('--warmup_epochs', default=5, type=int, 
+                        metavar='N', help='预热训练的回合数')
+    parser.add_argument('--min_lr', type=float, default=1e-6, 
+                        metavar='D', help='余弦退火的最小学习率')
+
     args = parser.parse_args(argv)
     return args
 
@@ -100,6 +106,8 @@ def train(args, trainset, evalset, dptnetlk):
         checkpoint = torch.load(args.resume)
         args.start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['model'])
+        if args.start_epoch >= args.warmup_epochs and 'lr_scheduler' in checkpoint and checkpoint['lr_scheduler'] is not None:
+            cosine_scheduler.load_state_dict(checkpoint['lr_scheduler'])
     print('resume epoch from {}'.format(args.start_epoch+1))
 
     evalloader = torch.utils.data.DataLoader(evalset,
@@ -121,10 +129,38 @@ def train(args, trainset, evalset, dptnetlk):
         min_loss = checkpoint['min_loss']
         min_info = checkpoint['min_info']
         optimizer.load_state_dict(checkpoint['optimizer'])
+        args.start_epoch = checkpoint['epoch']
+        # 如果有保存的学习率调度器状态，则加载
+        if args.start_epoch >= args.warmup_epochs and 'lr_scheduler' in checkpoint and checkpoint['lr_scheduler'] is not None:
+            cosine_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+
+    # 创建余弦退火调度器
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=args.max_epochs - args.warmup_epochs,
+        eta_min=args.min_lr
+    )
+
+    # 定义学习率更新函数，包含预热和余弦退火
+    def update_lr(epoch):
+        if epoch < args.warmup_epochs:
+            # 线性预热学习率
+            lr_scale = min(1., float(epoch + 1) / float(args.warmup_epochs))
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.lr * lr_scale
+        else:
+            # 使用余弦退火调度器
+            cosine_scheduler.step()
 
     # training
     LOGGER.debug('Begin Training!')
     for epoch in range(args.start_epoch, args.max_epochs):
+        # 更新学习率
+        update_lr(epoch)
+        
+        # 记录当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        
         running_loss, running_info = dptnetlk.train_one_epoch(
             model, trainloader, optimizer, args.device, 'train', args.data_type, num_random_points=args.num_random_points)
         val_loss, val_info = dptnetlk.eval_one_epoch(
@@ -133,13 +169,14 @@ def train(args, trainset, evalset, dptnetlk):
         is_best = val_loss < min_loss
         min_loss = min(val_loss, min_loss)
 
-        LOGGER.info('epoch, %04d, %f, %f, %f, %f', epoch + 1,
-                    running_loss, val_loss, running_info, val_info)
+        LOGGER.info('epoch, %04d, %f, %f, %f, %f, %.10f', epoch + 1,
+                    running_loss, val_loss, running_info, val_info, current_lr)
         snap = {'epoch': epoch + 1,
                 'model': model.state_dict(),
                 'min_loss': min_loss,
                 'min_info': min_info,
-                'optimizer': optimizer.state_dict(), }
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': cosine_scheduler.state_dict() if epoch >= args.warmup_epochs else None}
         if is_best:
             torch.save(model.state_dict(), '{}_{}.pth'.format(args.outfile, 'model_best'))
         torch.save(snap, '{}_{}.pth'.format(args.outfile, 'snap_last'))
