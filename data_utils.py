@@ -316,7 +316,7 @@ class PointRegistration_fixed_perturbation(torch.utils.data.Dataset):
         torch.manual_seed(713)
         self.dataset = dataset
         self.transf_ = load_pose(rigid_transform, len(self.dataset))
-        list_order = torch.randperm(len(self.dataset))
+        list_order = torch.randperm(min(len(self.dataset), len(self.transf_)))
         self.transf = self.transf_[list_order]
         self.sigma = sigma
         self.clip = clip

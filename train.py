@@ -45,7 +45,7 @@ def options(argv=None):
 
     # settings for Embedding
     parser.add_argument('--embedding', default='pointnet',
-                        type=str, help='特征提取器类型: pointnet, 3dmamba_v1')
+                        type=str, help='特征提取器类型: pointnet, 3dmamba_v1, 3dmamba_v2')
     parser.add_argument('--dim_k', default=1024, type=int,
                         metavar='K', help='dim. of the feature vector')
     

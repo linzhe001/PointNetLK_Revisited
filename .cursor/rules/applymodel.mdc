@@ -4,11 +4,13 @@ globs:
 alwaysApply: false
 ---
 
-# 自定义特征提取器实现
+# 自定义特征提取器实现指南
 
-根据`applymodel.mdc`规则，下面是完整的实现代码：
+根据当前代码库的架构，下面是集成新特征提取器的完整指南：
 
-## 1. 在feature_extraction.py中添加自定义特征提取器
+## 1. 创建特征提取器类
+
+所有特征提取器必须继承自`FeatureExtractor`基类，并实现相应的方法，并写进`feature_extraction.py`中，添加至末尾。示例如下：
 
 ```python
 class Custom_Features(FeatureExtractor):
@@ -17,6 +19,8 @@ class Custom_Features(FeatureExtractor):
     """
     def __init__(self, dim_k=1024):
         super(Custom_Features, self).__init__(dim_k)
+        # 必须设置特征提取器类型标识
+        self.extractor_type = "custom"
         
         # 定义网络层
         # 示例：更深的PointNet架构
@@ -40,63 +44,33 @@ class Custom_Features(FeatureExtractor):
         
         if iter == -1:
             # 记录每一层的中间结果用于雅可比矩阵计算
-            # 1. 第一个MLP块
-            x = self.mlp1[0](x)
+            # 重要：返回格式应与特征提取器类型对应
+            # 这里以自定义的多层结构为例
+            
+            # 第一个MLP块
+            x = self.mlp1[0](mdc:x)
             A1_x = x
-            x = self.mlp1[1](x)
+            x = self.mlp1[1](mdc:x)
             bn1_x = x
-            x = self.mlp1[2](x)
+            x = self.mlp1[2](mdc:x)
             M1 = (x > 0).type(torch.float)
             
-            x = self.mlp1[3](x)
-            A1_2_x = x 
-            x = self.mlp1[4](x)
-            bn1_2_x = x
-            x = self.mlp1[5](x)
-            M1_2 = (x > 0).type(torch.float)
-            
-            # 2. 第二个MLP块
-            x = self.mlp2[0](x)
-            A2_x = x
-            x = self.mlp2[1](x)
-            bn2_x = x
-            x = self.mlp2[2](x)
-            M2 = (x > 0).type(torch.float)
-            
-            x = self.mlp2[3](x)
-            A2_2_x = x
-            x = self.mlp2[4](x)
-            bn2_2_x = x
-            x = self.mlp2[5](x)
-            M2_2 = (x > 0).type(torch.float)
-            
-            # 3. 第三个MLP块
-            x = self.mlp3[0](x)
-            A3_x = x
-            x = self.mlp3[1](x)
-            bn3_x = x
-            x = self.mlp3[2](x)
-            M3 = (x > 0).type(torch.float)
+            # ... 更多层的中间结果收集
             
             # 最大池化
             max_idx = torch.max(x, -1)[-1]
             x = F.max_pool1d(x, x.size(-1))
             x = x.view(x.size(0), -1)
 
-            # 提取权重
+            # 提取相关权重
             A1 = self.mlp1[0].weight
-            A1_2 = self.mlp1[3].weight
-            A2 = self.mlp2[0].weight
-            A2_2 = self.mlp2[3].weight
-            A3 = self.mlp3[0].weight
-
-            # 返回特征和中间结果
-            # 注意：需要保持与原始PointNet接口一致的格式，但内容可以不同
-            return x, [M1, M1_2, M2, M2_2, M3], \
-                   [A1, A1_2, A2, A2_2, A3], \
-                   [A1_x, A1_2_x, A2_x, A2_2_x, A3_x], \
-                   [bn1_x, bn1_2_x, bn2_x, bn2_2_x, bn3_x], \
-                   max_idx
+            # ... 更多权重提取
+            
+            # 返回可能包括特定于此特征提取器的额外数据
+            # 例如，如果需要custom_data用于雅可比矩阵计算
+            custom_data = [...] # 特定于此特征提取器的数据
+            
+            return x, [M1, ...], [A1, ...], [A1_x, ...], [bn1_x, ...], max_idx, custom_data
         else:
             # 正常前向传播
             x = self.mlp1(x)
@@ -107,12 +81,18 @@ class Custom_Features(FeatureExtractor):
 
             return x
     
-    def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mode="train", 
-                     voxel_coords_diff=None, data_type='synthetic', num_points=None):
+    def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
+                     mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None, 
+                     custom_data=None):  # 添加特定于此特征提取器的参数
         """
         计算特征提取的雅可比矩阵
         
-        参数与基类相同，但实现方式需要匹配自定义网络结构
+        参数:
+            p0: 输入点云 [B,N,3]
+            其他参数：根据特征提取器需求定义
+            
+        返回:
+            雅可比矩阵 [B,K,6]
         """
         if num_points is None:
             num_points = p0.shape[1]
@@ -120,20 +100,18 @@ class Custom_Features(FeatureExtractor):
         dim_k = self.dim_k
         device = p0.device
         
-        # 1. 计算变形雅可比矩阵 - 与原始实现相同
+        # 1. 计算变形雅可比矩阵 - 通常保持不变
         g_ = torch.zeros(batch_size, 6).to(device)
         warp_jac = compute_warp_jac(g_, p0, num_points)   # B x N x 3 x 6
         
-        # 2. 计算特征雅可比矩阵 - 需要针对新架构修改
-        # 这里需要实现自定义特征提取器的特征雅可比矩阵计算
-        # 示例：使用自定义的feature_jac_custom函数
-        feature_j = feature_jac_custom(mask_fn, a_fn, ax_fn, bn_fn, device).to(device)
+        # 2. 计算特征雅可比矩阵 - 自定义实现
+        feature_j = feature_jac_custom(mask_fn, a_fn, ax_fn, bn_fn, custom_data, device).to(device)
         feature_j = feature_j.permute(0, 3, 1, 2)   # B x N x 6 x K
         
-        # 3. 组合得到最终雅可比矩阵 - 与原始实现相同
+        # 3. 组合得到最终雅可比矩阵
         J_ = torch.einsum('ijkl,ijkm->ijlm', feature_j, warp_jac)   # B x N x K x 6
         
-        # 4. 根据最大池化索引进行处理 - 与原始实现相同
+        # 4. 根据最大池化索引进行处理
         jac_max = J_.permute(0, 2, 1, 3)   # B x K x N x 6
         jac_max_ = []
         
@@ -148,7 +126,7 @@ class Custom_Features(FeatureExtractor):
         else:
             J = J_
         
-        # 处理真实数据的特殊情况 - 与原始实现相同
+        # 处理真实数据的特殊情况
         if mode == 'test' and data_type == 'real':
             J_ = J_.permute(1, 0, 2).reshape(dim_k, -1)   # K x (V6)
             warp_condition = cal_conditioned_warp_jacobian(voxel_coords_diff)   # V x 6 x 6
@@ -156,76 +134,85 @@ class Custom_Features(FeatureExtractor):
             J = torch.einsum('ij,jk->ik', J_, warp_condition).unsqueeze(0)   # 1 X K X 6
             
         return J
-
-
-# 实现自定义特征雅可比矩阵计算函数
-def feature_jac_custom(M, A, Ax, BN, device):
-    """
-    自定义特征雅可比矩阵计算
-    
-    参数:
-        M: 激活掩码列表 [M1, M1_2, M2, M2_2, M3]
-        A: 权重列表 [A1, A1_2, A2, A2_2, A3]
-        Ax: 卷积输出列表 [A1_x, A1_2_x, A2_x, A2_2_x, A3_x]
-        BN: 批归一化输出列表 [bn1_x, bn1_2_x, bn2_x, bn2_2_x, bn3_x]
-        device: 计算设备
-        
-    返回:
-        特征雅可比矩阵
-    """
-    # 解包输入列表
-    A1, A1_2, A2, A2_2, A3 = A
-    M1, M1_2, M2, M2_2, M3 = M
-    A1_x, A1_2_x, A2_x, A2_2_x, A3_x = Ax
-    bn1_x, bn1_2_x, bn2_x, bn2_2_x, bn3_x = BN
-
-    # 计算每一层的梯度传播
-    # 1 x c_in x c_out x 1
-    A1 = (A1.T).detach().unsqueeze(-1)
-    A1_2 = (A1_2.T).detach().unsqueeze(-1)
-    A2 = (A2.T).detach().unsqueeze(-1)
-    A2_2 = (A2_2.T).detach().unsqueeze(-1)
-    A3 = (A3.T).detach().unsqueeze(-1)
-
-    # 使用自动微分计算批量归一化的梯度
-    # B x 1 x c_out x N
-    dBN1 = torch.autograd.grad(outputs=bn1_x, inputs=A1_x, grad_outputs=torch.ones(bn1_x.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-    dBN1_2 = torch.autograd.grad(outputs=bn1_2_x, inputs=A1_2_x, grad_outputs=torch.ones(bn1_2_x.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-    dBN2 = torch.autograd.grad(outputs=bn2_x, inputs=A2_x, grad_outputs=torch.ones(bn2_x.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-    dBN2_2 = torch.autograd.grad(outputs=bn2_2_x, inputs=A2_2_x, grad_outputs=torch.ones(bn2_2_x.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-    dBN3 = torch.autograd.grad(outputs=bn3_x, inputs=A3_x, grad_outputs=torch.ones(bn3_x.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
-
-    # B x 1 x c_out x N
-    M1 = M1.detach().unsqueeze(1)
-    M1_2 = M1_2.detach().unsqueeze(1)
-    M2 = M2.detach().unsqueeze(1)
-    M2_2 = M2_2.detach().unsqueeze(1)
-    M3 = M3.detach().unsqueeze(1)
-
-    # 使用广播计算 --> B x c_in x c_out x N
-    A1BN1M1 = A1 * dBN1 * M1
-    A1_2BN1_2M1_2 = A1_2 * dBN1_2 * M1_2
-    A2BN2M2 = A2 * dBN2 * M2
-    A2_2BN2_2M2_2 = A2_2 * dBN2_2 * M2_2
-    A3BN3M3 = A3 * dBN3 * M3
-
-    # 使用einsum组合 - 需要根据自定义网络结构调整
-    A1BN1M1_A1_2 = torch.einsum('ijkl,ikml->ijml', A1BN1M1, A1_2BN1_2M1_2)
-    A1_2_A2 = torch.einsum('ijkl,ikml->ijml', A1BN1M1_A1_2, A2BN2M2)
-    A2_A2_2 = torch.einsum('ijkl,ikml->ijml', A1_2_A2, A2_2BN2_2M2_2)
-    A2_2_A3 = torch.einsum('ijkl,ikml->ijml', A2_A2_2, A3BN3M3)
-    
-    feat_jac = A2_2_A3
-
-    return feat_jac   # B x 3 x K x N
 ```
 
-## 2. 修改trainer.py中的create_features方法
+## 2. 修改model.py中的关键部分
+
+需要在`AnalyticalPointNetLK`类中修改两处关键代码：
 
 ```python
+def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic', **kwargs):
+    """
+    调用特征提取器的get_jacobian方法计算雅可比矩阵
+    根据特征提取器类型传递不同的参数
+    """
+    # 构建基本参数字典
+    base_params = {
+        'p0': p0, 
+        'mask_fn': Mask_fn, 
+        'a_fn': A_fn, 
+        'ax_fn': Ax_fn, 
+        'bn_fn': BN_fn, 
+        'max_idx': max_idx, 
+        'mode': mode,
+        'voxel_coords_diff': voxel_coords_diff,
+        'data_type': data_type,
+        'num_points': num_points
+    }
+    
+    # 合并所有参数
+    all_params = {**base_params, **kwargs}
+    
+    # 调用特征提取器的get_jacobian方法
+    return self.ptnet.get_jacobian(**all_params)
+```
 
-from feature_extraction import Pointnet_Features, Custom_Features
+在`iclk_new`方法中，处理不同特征提取器的forward返回值：
 
+```python
+# 计算雅可比矩阵所需的中间输出
+if mode == 'test':
+    # 调用特征提取器前向传播，获取中间结果
+    forward_outputs = self.ptnet(p0, -1)
+    
+    # 第一个输出始终是特征向量
+    f0 = forward_outputs[0]
+    
+    # 其余输出分配给标准参数
+    Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = forward_outputs[1:6]
+    
+    # 收集额外参数 (如果有)
+    extra_params = {}
+    if len(forward_outputs) > 6:
+        for i, param in enumerate(forward_outputs[6:]):
+            extra_params[f'extra_param_{i}'] = param
+    
+    # 调用Cal_Jac并传递所有参数
+    J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                    num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                    data_type=data_type, **extra_params)
+else:
+    # 训练模式下的类似处理...
+    random_points = p0[:, random_idx]
+    
+    # 类似的处理方式
+    forward_outputs = self.ptnet(random_points, -1)
+    f0 = forward_outputs[0]
+    Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = forward_outputs[1:6]
+    
+    extra_params = {}
+    if len(forward_outputs) > 6:
+        for i, param in enumerate(forward_outputs[6:]):
+            extra_params[f'extra_param_{i}'] = param
+    
+    J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
+                   num_random_points, random_points, mode, 
+                   voxel_coords_diff=None, data_type=data_type, **extra_params)
+```
+
+## 3. 修改trainer.py中的create_features方法
+
+```python
 def create_features(self):
     """
     创建特征提取网络
@@ -235,41 +222,62 @@ def create_features(self):
     """
     if self.embedding == 'pointnet':
         ptnet = Pointnet_Features(dim_k=self.dim_k)
+    elif self.embedding == '3dmamba_v1':
+        ptnet = Mamba3D_Features(dim_k=self.dim_k)
     elif self.embedding == 'custom':
         ptnet = Custom_Features(dim_k=self.dim_k)
-    # 可以在这里添加更多类型的特征提取器
+    # 添加新的特征提取器时，在这里添加相应的分支
     else:
         raise ValueError(f"未知的特征提取器类型: {self.embedding}")
         
     return ptnet.float()
 ```
 
-## 3. 修改train.py中的参数帮助文本
+## 4. 修改train.py中的命令行参数
 
 ```python
 # settings for Embedding
 parser.add_argument('--embedding', default='pointnet',
-                    type=str, help='特征提取器类型: pointnet, custom')
+                    type=str, help='特征提取器类型: pointnet, 3dmamba_v1, custom')
 ```
 
-## 进一步优化建议
+## 5. 在feature_extraction.py中实现自定义特征雅可比矩阵计算函数，应该写在特征提取器类后
 
-1. **增加批归一化动量参数**:
 ```python
-def __init__(self, dim_k=1024, bn_momentum=0.1):
-    # 允许调整批归一化动量参数
-    self.mlp1 = MLPNet(3, [64, 64], b_shared=True, bn_momentum=bn_momentum).layers
+def feature_jac_custom(M, A, Ax, BN, custom_data, device):
+    """
+    自定义特征雅可比矩阵计算函数
+    
+    参数:
+        M: 激活掩码列表 
+        A: 权重列表
+        Ax: 卷积输出列表
+        BN: 批归一化输出列表
+        custom_data: 特定于此特征提取器的数据
+        device: 计算设备
+        
+    返回:
+        特征雅可比矩阵
+    """
+    # 实现自定义特征雅可比矩阵计算逻辑
+    # ...
+    
+    return feat_jac
 ```
 
-2. **添加Dropout正则化**:
-```python
-def __init__(self, dim_k=1024, dropout=0.1):
-    # 在非共享层后添加Dropout
-    self.mlp1 = MLPNet(3, [64, 64], b_shared=True, dropout=dropout).layers
-```
+## 关键注意事项
 
-3. **实现注意力机制**:
-可以在特征提取过程中添加注意力机制，以便更好地关注点云中的关键区域。
+1. **返回值一致性**: 特征提取器的`forward`方法在`iter=-1`时，必须始终将主要特征向量作为第一个返回值，后面跟着必要的中间结果。
 
-4. **多尺度特征融合**:
-考虑使用多尺度特征融合，以捕获不同尺度下的点云特征。
+2. **参数扩展**: 在添加新的特征提取器时，如果需要额外参数，应通过`**kwargs`机制在`Cal_Jac`方法中传递，而不是直接修改函数签名。
+
+3. **类型标识**: 每个特征提取器必须设置唯一的`extractor_type`标识，模型将使用此标识确定如何处理该特征提取器的输出。
+
+4. **向后兼容**: 确保修改不会破坏现有的`pointnet`和`3dmamba_v1`特征提取器的功能。
+
+通过这种架构，新增特征提取器时只需：
+1. 创建新的特征提取器类
+2. 实现必要的方法
+3. 在`trainer.py`和`train.py`中添加相应的支持
+
+这样可以最小化对现有代码的修改，同时保持良好的可扩展性。

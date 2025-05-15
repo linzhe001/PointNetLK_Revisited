@@ -6,6 +6,15 @@ __pycache__/
 # C extensions
 *.so
 
+# 忽略本地__pycache__和.cursor文件夹
+__pycache__/
+.cursor/
+
+# 数据和模型文件
+*.mdc
+*.csv
+*.pth
+
 # Distribution / packaging
 .Python
 build/

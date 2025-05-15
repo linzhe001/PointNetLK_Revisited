@@ -189,6 +189,7 @@ class Pointnet_Features(FeatureExtractor):
         
         # 2. 计算特征雅可比矩阵
         feature_j = feature_jac(mask_fn, a_fn, ax_fn, bn_fn, device).to(device)
+        #feature_j = feature_jac_auto_diff(p0, self, device).to(device)
         feature_j = feature_j.permute(0, 3, 1, 2)   # B x N x 6 x K
         
         # 3. 组合得到最终雅可比矩阵
@@ -269,6 +270,43 @@ def feature_jac(M, A, Ax, BN, device):
 
     return feat_jac   # B x 3 x K x N
 
+
+### auto diff
+def feature_jac_auto_diff(points, model, device=None):
+    """
+    使用PyTorch自动微分计算特征雅可比矩阵
+    
+    参数:
+        points: 输入点云 [B,N,3]
+        model: 特征提取模型
+        device: 计算设备
+        
+    返回:
+        特征雅可比矩阵 [B,3,K,N]
+    """
+    batch_size, num_points, _ = points.shape
+    
+    # 确保输入可导
+    points_clone = points.clone().detach().requires_grad_(True)
+    
+    # 为前向计算定义一个包装器函数
+    def feature_extractor(p):
+        # 使用iter=0表示普通前向计算模式
+        return model(p, iter=0)
+    
+    # 计算特征对点云坐标的雅可比矩阵
+    jacobian = torch.zeros(batch_size, model.dim_k, num_points, 3).to(device)
+    
+    for b in range(batch_size):
+        # 计算单个批次的雅可比矩阵
+        jac = torch.func.jacrev(feature_extractor)(points_clone[b:b+1])  # [K,1,N,3]
+        
+        # 直接通过view方法重塑张量，跳过squeeze操作
+        # 已知张量形状为[1024, 1, 100, 3]
+        jacobian[b] = jac.view(model.dim_k, num_points, 3)
+    
+    # 调整维度顺序以匹配原函数输出格式
+    return jacobian.permute(0, 3, 1, 2)  # [B,3,K,N]
 
 
 ##### new model for mamba3d ####
@@ -549,10 +587,7 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     dBN3 = torch.autograd.grad(outputs=BN3, inputs=Ax3, grad_outputs=torch.ones(BN3.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     bn_grad_end = time.time()
     #print(f"BN梯度计算耗时: {bn_grad_end - bn_grad_start:.4f} 秒")
-        # 在使用前处理BN梯度
-    dBN1[torch.abs(dBN1) < 1e-10] = 0.0
-    dBN2[torch.abs(dBN2) < 1e-10] = 0.0
-    dBN3[torch.abs(dBN3) < 1e-10] = 0.0
+
     # B x 1 x c_out x N
     M1 = M1.detach().unsqueeze(1)
     M2 = M2.detach().unsqueeze(1)
@@ -566,11 +601,7 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     dMamba3 = torch.autograd.grad(outputs=mamba3_out, inputs=mamba3_in, grad_outputs=torch.ones(mamba3_out.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
     mamba_grad_end = time.time()
     #print(f"Mamba梯度计算耗时: {mamba_grad_end - mamba_grad_start:.4f} 秒")
-    # 在计算梯度后添加
-    # 避免极小梯度值
-    dMamba1[torch.abs(dMamba1) < 1e-10] = 0.0
-    dMamba2[torch.abs(dMamba2) < 1e-10] = 0.0
-    dMamba3[torch.abs(dMamba3) < 1e-10] = 0.0
+
     # 使用广播计算，包含Mamba层 --> B x c_in x c_out x N
     comp_start = time.time()
     A1BN1M1 = A1 * (dBN1 * M1 * dMamba1)
@@ -591,3 +622,280 @@ def feature_jac_mamba3dv1(M, A, Ax, BN, mamba_in, mamba_out, device=None):
     #print(f"雅可比矩阵总计算耗时: {total_end - total_start:.4f} 秒")
     
     return feat_jac # B x 3 x K x N
+
+
+##### 3DMamba V2 特征提取器 ####
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model):
+        super(PositionalEncoding, self).__init__()
+        self.linear = nn.Linear(3, d_model)
+        self.weight = self.linear.weight  # 存储权重引用用于雅可比矩阵计算
+
+    def forward(self, coords):
+        # coords: [B, N, 3]
+        return self.linear(coords)
+
+class BiSSM(nn.Module):
+    def __init__(self, d_model):
+        super(BiSSM, self).__init__()
+        self.forward_ssm = nn.GRU(d_model, d_model, batch_first=True)
+        self.backward_ssm = nn.GRU(d_model, d_model, batch_first=True)
+
+    def forward(self, x):
+        # x: [B, N, C]
+        x_forward, _ = self.forward_ssm(x)
+        x_backward, _ = self.backward_ssm(torch.flip(x, dims=[1]))
+        x_backward = torch.flip(x_backward, dims=[1])
+        return x_forward + x_backward
+
+class PointCloudMambaBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(PointCloudMambaBlock, self).__init__()
+        # 使用Sequential组织层
+        self.seq = nn.Sequential(
+            PositionalEncoding(in_channels),
+            BiSSM(in_channels),
+            nn.Linear(in_channels, out_channels),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU()
+        )
+        
+        # 保存各层引用以便访问
+        self.pos_enc = self.seq[0]
+        self.bi_ssm = self.seq[1]
+        self.linear = self.seq[2]
+        self.bn = self.seq[3]
+        self.relu = self.seq[4]
+
+    def forward(self, x):
+        return self.seq(x)
+
+class Mamba3D_V2_Features(FeatureExtractor):
+    """
+    基于Mamba3D V2的特征提取网络
+    """
+    def __init__(self, dim_k=1024):
+        super(Mamba3D_V2_Features, self).__init__(dim_k)
+        self.extractor_type = "3dmamba_v2"
+        
+        self.block1 = PointCloudMambaBlock(3, 64)
+        self.block2 = PointCloudMambaBlock(64, 128)
+        self.block3 = PointCloudMambaBlock(128, dim_k)
+
+    def forward(self, points, iter):
+        """
+        前向传播，提取点云特征
+        
+        参数:
+            points: 输入点云 [B, N, 3]
+            iter: 迭代标志
+            
+        返回:
+            当iter=-1时: 返回特征和中间结果用于雅可比矩阵计算
+            其他情况: 返回特征向量 [B,dim_k]
+        """
+        # points: [B, N, 3]
+        x = points  # [B, N, 3]
+        
+        if iter == -1:
+            # 第一个块 - 收集中间状态
+            x = self.block1.pos_enc(x)
+            bissm_in1 = x
+            x = self.block1.bi_ssm(x)
+            bissm_out1 = x
+            x = self.block1.linear(x)
+            bn_in1 = x
+            x = self.block1.bn(x.transpose(1, 2)).transpose(1, 2)
+            bn_out1 = x
+            x = self.block1.relu(x)
+            M1 = (x > 0).float()
+            
+            # 第二个块
+            x = self.block2.pos_enc(x)
+            bissm_in2 = x
+            x = self.block2.bi_ssm(x)
+            bissm_out2 = x
+            x = self.block2.linear(x)
+            bn_in2 = x
+            x = self.block2.bn(x.transpose(1, 2)).transpose(1, 2)
+            bn_out2 = x
+            x = self.block2.relu(x)
+            M2 = (x > 0).float()
+            
+            # 第三个块
+            x = self.block3.pos_enc(x)
+            bissm_in3 = x
+            x = self.block3.bi_ssm(x)
+            bissm_out3 = x
+            x = self.block3.linear(x)
+            bn_in3 = x
+            x = self.block3.bn(x.transpose(1, 2)).transpose(1, 2)
+            bn_out3 = x
+            x = self.block3.relu(x)
+            M3 = (x > 0).float()
+
+            # 全局最大池化
+            max_idx = torch.max(x, 1)[1]
+            x = torch.max(x, dim=1)[0]
+            
+            # 提取权重
+            A11 = self.block1.pos_enc.weight
+            A12 = self.block2.pos_enc.weight
+            A13 = self.block3.pos_enc.weight
+
+            A21 = self.block1.linear.weight
+            A22 = self.block2.linear.weight
+            A23 = self.block3.linear.weight
+            
+            return x, [M1, M2, M3], [A21, A22, A23], [bn_in1, bn_in2, bn_in3], [bn_out1, bn_out2, bn_out3], max_idx, [A11, A12, A13], [bissm_in1, bissm_in2, bissm_in3], [bissm_out1, bissm_out2, bissm_out3]
+        else:
+            # 标准前向传播
+            x = self.block1(x)
+            x = self.block2(x)
+            x = self.block3(x)
+            x = torch.max(x, dim=1)[0]
+            return x
+    
+    def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
+                    pos_enc_weights=None, bissm_in=None, bissm_out=None, mode="train", 
+                    voxel_coords_diff=None, data_type='synthetic', num_points=None):
+        """
+        计算特征提取的雅可比矩阵
+        
+        参数:
+            p0: 输入点云 [B,N,3]
+            mask_fn, a_fn, ax_fn, bn_fn: 中间层输出
+            max_idx: 最大池化索引
+            pos_enc_weights: 位置编码权重
+            bissm_in: BiSSM层的输入
+            bissm_out: BiSSM层的输出
+            mode: 训练或测试模式
+            voxel_coords_diff: 体素坐标差异（用于真实数据）
+            data_type: 数据类型（'synthetic'或'real'）
+            num_points: 点云中的点数量
+            
+        返回:
+            雅可比矩阵 [B,K,6]
+        """
+        if num_points is None:
+            num_points = p0.shape[1]
+        batch_size = p0.shape[0]
+        dim_k = self.dim_k
+        device = p0.device
+        
+        # 1. 计算变形雅可比矩阵
+        g_ = torch.zeros(batch_size, 6).to(device)
+        warp_jac = utils.compute_warp_jac(g_, p0, num_points)   # B x N x 3 x 6
+        
+        # 2. 计算特征雅可比矩阵
+        feature_j = feature_jac_3dmamba_v2(mask_fn, a_fn, ax_fn, bn_fn, pos_enc_weights, bissm_in, bissm_out, device).to(device)
+        feature_j = feature_j.permute(0, 3, 1, 2)   # B x N x 6 x K
+        
+        # 3. 组合得到最终雅可比矩阵
+        J_ = torch.einsum('ijkl,ijkm->ijlm', feature_j, warp_jac)   # B x N x K x 6
+        
+        # 4. 根据最大池化索引进行处理
+        jac_max = J_.permute(0, 2, 1, 3)   # B x K x N x 6
+        jac_max_ = []
+        
+        for i in range(batch_size):
+            jac_max_t = jac_max[i, torch.arange(dim_k), max_idx[i]]
+            jac_max_.append(jac_max_t)
+        jac_max_ = torch.cat(jac_max_)
+        J_ = jac_max_.reshape(batch_size, dim_k, 6)   # B x K x 6
+        
+        if len(J_.size()) < 3:
+            J = J_.unsqueeze(0)
+        else:
+            J = J_
+        
+        # 处理真实数据的特殊情况
+        if mode == 'test' and data_type == 'real':
+            J_ = J_.permute(1, 0, 2).reshape(dim_k, -1)   # K x (V6)
+            warp_condition = utils.cal_conditioned_warp_jacobian(voxel_coords_diff)   # V x 6 x 6
+            warp_condition = warp_condition.permute(0,2,1).reshape(-1, 6)   # (V6) x 6
+            J = torch.einsum('ij,jk->ik', J_, warp_condition).unsqueeze(0)   # 1 X K X 6
+            
+        return J
+
+# 特征雅可比矩阵计算 for 3DMamba V2
+def feature_jac_3dmamba_v2(M, linear_weights, bn_in, bn_out, pos_enc_weights, bissm_in, bissm_out, device=None):
+    """
+    计算3DMamba V2特征雅可比矩阵
+    
+    参数:
+        M: 激活掩码列表 [M1, M2, M3]
+        A: 线性层权重列表 [A21, A22, A23]
+        Ax: 线性层输入列表 [bn_in1, bn_in2, bn_in3]
+        BN: 批归一化输出列表 [bn_out1, bn_out2, bn_out3]
+        pos_enc_weights: 位置编码权重列表 [A11, A12, A13]
+        bissm_in: BiSSM层输入列表 [bissm_in1, bissm_in2, bissm_in3]
+        bissm_out: BiSSM层输出列表 [bissm_out1, bissm_out2, bissm_out3]
+        device: 计算设备
+        
+    返回:
+        特征雅可比矩阵 [B, 3, K, N]
+    """
+    # 解包输入列表
+    A21, A22, A23 = linear_weights
+    M1, M2, M3 = M
+    bn_in1, bn_in2, bn_in3 = bn_in
+    bn_out1, bn_out2, bn_out3 = bn_out
+    A11, A12, A13 = pos_enc_weights
+    
+    # 解包BiSSM层输入输出
+    bissm_in1, bissm_in2, bissm_in3 = bissm_in
+    bissm_out1, bissm_out2, bissm_out3 = bissm_out
+
+    # 准备权重张量
+
+
+    # 解包线性层权重
+    A21 = (A21.T).detach().unsqueeze(-1)
+    A22 = (A22.T).detach().unsqueeze(-1)
+    A23 = (A23.T).detach().unsqueeze(-1)
+
+    # 使用自动微分计算批量归一化的梯度
+    dBN1 = torch.autograd.grad(outputs=bn_out1, inputs=bn_in1, grad_outputs=torch.ones(bn_out1.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    dBN2 = torch.autograd.grad(outputs=bn_out2, inputs=bn_in2, grad_outputs=torch.ones(bn_out2.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    dBN3 = torch.autograd.grad(outputs=bn_out3, inputs=bn_in3, grad_outputs=torch.ones(bn_out3.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    
+
+    # 准备掩码张量
+    M1 = M1.detach().unsqueeze(1)
+    M2 = M2.detach().unsqueeze(1)
+    M3 = M3.detach().unsqueeze(1)
+
+    # 计算BiSSM层的梯度
+    dBiSSM1 = torch.autograd.grad(outputs=bissm_out1, inputs=bissm_in1, grad_outputs=torch.ones(bissm_out1.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    dBiSSM2 = torch.autograd.grad(outputs=bissm_out2, inputs=bissm_in2, grad_outputs=torch.ones(bissm_out2.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    dBiSSM3 = torch.autograd.grad(outputs=bissm_out3, inputs=bissm_in3, grad_outputs=torch.ones(bissm_out3.size()).to(device), retain_graph=True)[0].unsqueeze(1).detach()
+    
+    # 过滤极小梯度值
+    dBiSSM1[torch.abs(dBiSSM1) < 1e-10] = 0.0
+    dBiSSM2[torch.abs(dBiSSM2) < 1e-10] = 0.0
+    dBiSSM3[torch.abs(dBiSSM3) < 1e-10] = 0.0
+
+    # 位置编码梯度
+    PE1 = A11.detach().unsqueeze(-1).to(device)  # [C_out, 3, 1]
+    PE2 = A12.detach().unsqueeze(-1).to(device)
+    PE3 = A13.detach().unsqueeze(-1).to(device)
+
+    # 组合所有梯度计算特征雅可比矩阵
+    L1 = dBiSSM1 * PE1  # 位置编码和BiSSM层的组合梯度
+    L2 = dBiSSM2 * PE2
+    L3 = dBiSSM3 * PE3
+    
+    # 完整的梯度链计算
+    A1BN1M1 = A11 * dBN1 * M1 * L1
+    A2BN2M2 = A22 * dBN2 * M2 * L2
+    A3BN3M3 = A23 * dBN3 * M3 * L3
+    
+    # 使用einsum组合
+    A1BN1M1_A2BN2M2 = torch.einsum('ijkl,ikml->ijml', A1BN1M1, A2BN2M2)   # B x 3 x 64 x N
+    A2BN2M2_A3BN3M3 = torch.einsum('ijkl,ikml->ijml', A1BN1M1_A2BN2M2, A3BN3M3)   # B x 3 x K x N
+    
+    feat_jac = A2BN2M2_A3BN3M3
+
+    return feat_jac   # B x 3 x K x N
