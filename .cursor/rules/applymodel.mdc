@@ -10,7 +10,7 @@ alwaysApply: false
 
 ## 1. 创建特征提取器类
 
-所有特征提取器必须继承自`FeatureExtractor`基类，并实现相应的方法，并写进`feature_extraction.py`中，添加至末尾。示例如下：
+所有特征提取器必须继承自`FeatureExtractor`基类，并实现相应的方法：
 
 ```python
 class Custom_Features(FeatureExtractor):

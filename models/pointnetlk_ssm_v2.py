@@ -64,7 +64,7 @@ class SSMBlock(nn.Module):
         h = torch.zeros(x.size(0), self.dim, self.d_state, device=x.device)
         outputs = []
         for i in range(x.size(1)):
-            h = A_bar[:, i] @ h.unsqueeze(-1)).squeeze(-1) + B_bar[:, i].squeeze(-1)
+            h = (A_bar[:, i] @ h.unsqueeze(-1)).squeeze(-1) + B_bar[:, i].squeeze(-1)
             y_i = (h @ C[:, i].unsqueeze(-1)).squeeze(-1) + D * x_proj[:, i]
             outputs.append(y_i)
         

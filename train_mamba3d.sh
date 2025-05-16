@@ -3,19 +3,19 @@
 DATASET_PATH="/mnt/f/Datasets/ModelNet40"
 
 # 训练参数
-OUTPUT_FILE="./logs/mamba3d_modelnet40"
+OUTPUT_FILE="./logs/mamba3dv2_modelnet40_new"  # 修改输出文件名
 CATEGORY_FILE="./dataset/modelnet40_half1.txt"
 NUM_POINTS=1000
 NUM_RANDOM_POINTS=100
 MAG=0.8
 BATCH_SIZE=32
 MAX_EPOCHS=100
-LEARNING_RATE=1e-5 # 调整初始学习率
+LEARNING_RATE=1e-5
 DECAY_RATE=1e-4
-WARMUP_EPOCHS=5     # 学习率预热轮数
-MIN_LR=1e-8       # 余弦退火最小学习率
-EMBEDDING="3dmamba_v1"  # 使用Mamba3D特征提取器
-DIM_K=1024
+WARMUP_EPOCHS=5
+MIN_LR=1e-8
+EMBEDDING="fastpointtransformer_v2"
+DIM_K=1024  # 确保这个维度与特征提取器匹配
 MAX_ITER=10
 
 # 运行训练命令
@@ -37,6 +37,9 @@ python train.py \
     --embedding ${EMBEDDING} \
     --dim_k ${DIM_K} \
     --max_iter ${MAX_ITER} \
-    --device "cuda:0"
+    --device "cuda:0" \
+    --resume "" \
+    --pretrained "" \
+    --start_epoch 0
 
 echo "训练完成！Mamba3D模型保存在 ${OUTPUT_FILE}_*.pth"

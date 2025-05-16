@@ -181,7 +181,7 @@ class AnalyticalPointNetLK(torch.nn.Module):
         dg = self.exp(dx)
         return dg.matmul(g.float())
 
-    def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic', mamba_in=None, mamba_out=None, pos_enc_weights=None):
+    def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic', mamba_in=None, mamba_out=None, extra_param_0=None):
         """
         调用特征提取器的get_jacobian方法计算雅可比矩阵
         """
@@ -224,13 +224,56 @@ class AnalyticalPointNetLK(torch.nn.Module):
                 ax_fn=Ax_fn, 
                 bn_fn=BN_fn, 
                 max_idx=max_idx, 
-                pos_enc_weights=pos_enc_weights,
                 bissm_in=mamba_in,
                 bissm_out=mamba_out,
                 mode=mode,
                 voxel_coords_diff=voxel_coords_diff,
                 data_type=data_type,
                 num_points=num_points
+            )
+        elif self.extractor_type == "pointnet_attention_v1":
+            # PointNet注意力特征提取器需要额外的参数
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points,
+                extra_param_0=extra_param_0
+            )
+        elif self.extractor_type == "fastpointtransformer_v1":
+            # FastPointTransformer特征提取器
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points
+            )
+        elif self.extractor_type == "fastpointtransformer_v2":
+            # FastPointTransformer V2特征提取器
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points,
+                extra_param_0=extra_param_0
             )
         else:
             raise ValueError(f"不支持的特征提取器类型: {self.extractor_type}")
@@ -277,11 +320,25 @@ class AnalyticalPointNetLK(torch.nn.Module):
                               num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
                               data_type=data_type, mamba_in=mamba_in, mamba_out=mamba_out)
             elif self.extractor_type == "3dmamba_v2":
-                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, pos_enc_weights, bissm_in, bissm_out = self.ptnet(p0, -1)
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, bissm_in, bissm_out = self.ptnet(p0, -1)
                 J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
                               num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
-                              data_type=data_type, mamba_in=bissm_in, mamba_out=bissm_out, 
-                              pos_enc_weights=pos_enc_weights)
+                              data_type=data_type, mamba_in=bissm_in, mamba_out=bissm_out)
+            elif self.extractor_type == "pointnet_attention_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, attn_data = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type, extra_param_0=attn_data)
+            elif self.extractor_type == "fastpointtransformer_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type)
+            elif self.extractor_type == "fastpointtransformer_v2":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, fpt_data = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type, extra_param_0=fpt_data)
         else:
             if num_points >= num_random_points:
                 random_idx = np.random.choice(num_points, num_random_points, replace=False)
@@ -301,12 +358,28 @@ class AnalyticalPointNetLK(torch.nn.Module):
                              voxel_coords_diff=None, data_type=data_type,
                              mamba_in=mamba_in, mamba_out=mamba_out)
             elif self.extractor_type == "3dmamba_v2":
-                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, pos_enc_weights, bissm_in, bissm_out = self.ptnet(random_points, -1)
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, bissm_in, bissm_out = self.ptnet(random_points, -1)
                 J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
                              num_random_points, random_points, mode, 
                              voxel_coords_diff=None, data_type=data_type,
-                             mamba_in=bissm_in, mamba_out=bissm_out,
-                             pos_enc_weights=pos_enc_weights)
+                             mamba_in=bissm_in, mamba_out=bissm_out)
+            elif self.extractor_type == "pointnet_attention_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, attn_data = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
+                             num_random_points, random_points, mode, 
+                             voxel_coords_diff=None, data_type=data_type,
+                             extra_param_0=attn_data)
+            elif self.extractor_type == "fastpointtransformer_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
+                             num_random_points, random_points, mode, 
+                             voxel_coords_diff=None, data_type=data_type)
+            elif self.extractor_type == "fastpointtransformer_v2":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, fpt_data = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, 
+                             num_random_points, random_points, mode, 
+                             voxel_coords_diff=None, data_type=data_type,
+                             extra_param_0=fpt_data)
 
         # compute psuedo inverse of the Jacobian to solve delta(xi)
         Jt = J.transpose(1, 2)   # [B, 6, K]

@@ -10,7 +10,7 @@ from open3d.web_visualizer import draw   # for notebook
 
 import model
 import utils
-from feature_extraction import Pointnet_Features, Mamba3D_Features, Mamba3D_V2_Features
+from feature_extraction import Pointnet_Features, Mamba3D_Features, Mamba3D_V2_Features, Pointnet_Attention_Features, FastPointTransformer_Features, Pointnet_fastpointtransformer_v2
 
 
 LOGGER = logging.getLogger(__name__)
@@ -44,6 +44,12 @@ class TrainerAnalyticalPointNetLK:
             ptnet = Mamba3D_Features(dim_k=self.dim_k)
         elif self.embedding == '3dmamba_v2':
             ptnet = Mamba3D_V2_Features(dim_k=self.dim_k)
+        elif self.embedding == 'pointnet_attention_v1':
+            ptnet = Pointnet_Attention_Features(dim_k=self.dim_k)
+        elif self.embedding == 'fastpointtransformer_v1':
+            ptnet = FastPointTransformer_Features(dim_k=self.dim_k)
+        elif self.embedding == 'fastpointtransformer_v2':
+            ptnet = Pointnet_fastpointtransformer_v2(dim_k=self.dim_k)
         # 可以在这里添加其他特征提取器的创建
         else:
             raise ValueError(f"未知的特征提取器类型: {self.embedding}")
