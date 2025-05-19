@@ -6,6 +6,7 @@ import logging
 import torch
 import torch.utils.data
 import torchvision
+import numpy as np
 
 import data_utils
 import trainer
@@ -82,6 +83,16 @@ def options(argv=None):
                         metavar='N', help='预热训练的回合数')
     parser.add_argument('--min_lr', type=float, default=1e-6, 
                         metavar='D', help='余弦退火的最小学习率')
+                        
+    # 增加C3VD相关参数
+    parser.add_argument('--pair-mode', default='one_to_one', type=str,
+                      metavar='MODE', help='点云配对模式: one_to_one, scene_reference, source_to_source, target_to_target, all')
+    parser.add_argument('--reference-name', default='', type=str,
+                      metavar='NAME', help='scene_reference模式下的参考点云名称')
+    parser.add_argument('--scene-split', action='store_true',
+                      help='是否使用场景划分')
+    parser.add_argument('--test-scenes', type=str, default='',
+                       help='指定测试场景，用逗号分隔场景名称，如"sigmoid,cecum"')
 
     args = parser.parse_args(argv)
     return args
@@ -207,6 +218,85 @@ def get_datasets(args):
 
         trainset = data_utils.PointRegistration(traindata, data_utils.RandomTransformSE3(args.mag))
         evalset = data_utils.PointRegistration(evaldata, data_utils.RandomTransformSE3(args.mag))
+    elif args.dataset_type == 'c3vd':
+        # 添加C3VD数据集支持
+        transform = torchvision.transforms.Compose([
+                    data_utils.Resampler(args.num_points)])
+        
+        # 确定数据路径
+        source_path = os.path.join(args.dataset_path, 'C3VD_ply_source')
+        target_path = os.path.join(args.dataset_path, 'visible_point_cloud_ply_depth')
+        
+        print(f"加载C3VD数据集，配对模式: {args.pair_mode}")
+        print(f"源点云路径: {source_path}")
+        print(f"目标点云路径: {target_path}")
+        
+        # 创建C3VD数据集
+        c3vd_dataset = data_utils.C3VDDataset(
+            source_path, target_path, transform,
+            pair_mode=args.pair_mode,
+            reference_name=args.reference_name
+        )
+        
+        # 实现场景划分或随机划分
+        if args.scene_split:
+            print("使用场景划分...")
+            # 获取所有场景名称
+            all_scenes = c3vd_dataset.scenes
+            
+            # 检查是否有指定测试场景
+            if args.test_scenes:
+                # 按逗号分隔获取指定的测试场景列表
+                test_scenes = args.test_scenes.split(',')
+                # 筛选有效的测试场景
+                valid_test_scenes = [scene for scene in test_scenes if scene in all_scenes]
+                
+                if not valid_test_scenes:
+                    print("警告: 指定的测试场景不在数据集中，将使用随机划分")
+                    np.random.shuffle(all_scenes)
+                    split_idx = int(len(all_scenes) * 0.8)
+                    train_scenes = all_scenes[:split_idx]
+                    test_scenes = all_scenes[split_idx:]
+                else:
+                    # 使用指定的测试场景，其余作为训练场景
+                    test_scenes = valid_test_scenes
+                    train_scenes = [scene for scene in all_scenes if scene not in test_scenes]
+                    print(f"使用指定测试场景: {test_scenes}")
+            else:
+                # 没有指定测试场景，使用随机划分
+                np.random.shuffle(all_scenes)
+                split_idx = int(len(all_scenes) * 0.8)
+                train_scenes = all_scenes[:split_idx]
+                test_scenes = all_scenes[split_idx:]
+            
+            print(f"训练场景: {len(train_scenes)}个, 测试场景: {len(test_scenes)}个")
+            print(f"训练场景列表: {train_scenes}")
+            print(f"测试场景列表: {test_scenes}")
+            
+            # 获取训练和测试样本的索引
+            train_indices = c3vd_dataset.get_scene_indices(train_scenes)
+            test_indices = c3vd_dataset.get_scene_indices(test_scenes)
+            
+            print(f"训练样本数量: {len(train_indices)}")
+            print(f"测试样本数量: {len(test_indices)}")
+            
+            # 创建子集
+            train_dataset = torch.utils.data.Subset(c3vd_dataset, train_indices)
+            eval_dataset = torch.utils.data.Subset(c3vd_dataset, test_indices)
+        else:
+            print("使用随机划分...")
+            # 随机划分训练和测试集
+            dataset_size = len(c3vd_dataset)
+            indices = list(range(dataset_size))
+            np.random.shuffle(indices)
+            split_idx = int(dataset_size * 0.8)
+            
+            train_dataset = torch.utils.data.Subset(c3vd_dataset, indices[:split_idx])
+            eval_dataset = torch.utils.data.Subset(c3vd_dataset, indices[split_idx:])
+        
+        # 传递mag参数给C3VDset4tracking
+        trainset = data_utils.C3VDset4tracking(train_dataset, args.num_points, mag=args.mag)
+        evalset = data_utils.C3VDset4tracking(eval_dataset, args.num_points, mag=args.mag)
     else:
         print('wrong dataset type!')
 

@@ -11,8 +11,274 @@ import six
 import copy
 import csv
 import open3d as o3d
+from plyfile import PlyData  # 添加PLY库支持
 
 import utils
+
+
+def plyread(file_path):
+    """从PLY文件读取点云"""
+    ply_data = PlyData.read(file_path)
+    pc = np.vstack([
+        ply_data['vertex']['x'],
+        ply_data['vertex']['y'],
+        ply_data['vertex']['z']
+    ]).T
+    return torch.from_numpy(pc.astype(np.float32))
+
+
+class C3VDDataset(torch.utils.data.Dataset):
+    """C3VD数据集加载器"""
+    def __init__(self, source_root, target_root=None, transform=None, pair_mode='one_to_one', reference_name=None):
+        self.source_root = source_root
+        self.pair_mode = pair_mode
+        self.reference_name = reference_name
+        
+        # 设置目标点云路径
+        if target_root is None:
+            base_dir = os.path.dirname(source_root)
+            self.target_root = os.path.join(base_dir, 'visible_point_cloud_ply_depth')
+        else:
+            self.target_root = target_root
+            
+        print(f"\n====== C3VD数据集配置 ======")
+        print(f"配对模式: {pair_mode}")
+        print(f"源点云目录: {self.source_root}")
+        print(f"目标点云目录: {self.target_root}")
+        
+        self.transform = transform
+        
+        # 获取场景文件夹（文件夹的全名）
+        self.folder_names = []
+        for scene_dir in glob.glob(os.path.join(source_root, "*")):
+            if os.path.isdir(scene_dir):
+                folder_name = os.path.basename(scene_dir)
+                self.folder_names.append(folder_name)
+        
+        # 获取场景前缀（第一个下划线前的部分）
+        self.scenes = []
+        self.scene_to_folders = {}  # 映射场景名到包含的文件夹
+        
+        for folder_name in self.folder_names:
+            # 提取第一个下划线前的部分作为场景名
+            scene_name = folder_name.split('_')[0]
+            
+            # 如果是新场景名，添加到场景列表
+            if scene_name not in self.scenes:
+                self.scenes.append(scene_name)
+                self.scene_to_folders[scene_name] = []
+                
+            # 将文件夹添加到对应的场景组
+            self.scene_to_folders[scene_name].append(folder_name)
+        
+        print(f"识别到 {len(self.scenes)} 个场景，共 {len(self.folder_names)} 个文件夹")
+        for scene in self.scenes:
+            print(f"场景 '{scene}' 包含 {len(self.scene_to_folders[scene])} 个文件夹")
+        
+        # 获取点云对
+        self.pairs = []
+        self.pair_scenes = []  # 存储每对点云对应的场景名
+        
+        # 获取场景中的点云文件
+        self.scene_source_files = {}
+        self.scene_target_files = {}
+        
+        # 首先，按文件夹组织文件
+        self.folder_source_files = {}
+        self.folder_target_files = {}
+        
+        for folder_name in self.folder_names:
+            source_files = glob.glob(os.path.join(source_root, folder_name, "????_depth_pcd.ply"))
+            self.folder_source_files[folder_name] = sorted(source_files)
+            
+            target_files = glob.glob(os.path.join(self.target_root, folder_name, "frame_????_visible.ply"))
+            self.folder_target_files[folder_name] = sorted(target_files)
+        
+        # 然后，按场景名组织文件
+        for scene in self.scenes:
+            self.scene_source_files[scene] = []
+            self.scene_target_files[scene] = []
+            
+            for folder in self.scene_to_folders[scene]:
+                self.scene_source_files[scene].extend(self.folder_source_files[folder])
+                self.scene_target_files[scene].extend(self.folder_target_files[folder])
+        
+        # 创建点云对
+        self._create_one_to_one_pairs()
+        
+    def _create_one_to_one_pairs(self):
+        """创建源点云到目标点云的一一对应配对"""
+        pair_count = 0
+        
+        for folder_name in self.folder_names:  # 使用文件夹全名查找文件
+            scene = folder_name.split('_')[0]  # 但记录场景名为前缀
+            source_files = self.folder_source_files.get(folder_name, [])
+            
+            for source_file in source_files:
+                basename = os.path.basename(source_file)
+                frame_idx = basename[:4]
+                
+                # 在同一个文件夹中查找对应的目标点云
+                target_file = os.path.join(self.target_root, folder_name, f"frame_{frame_idx}_visible.ply")
+                
+                if os.path.exists(target_file):
+                    self.pairs.append((source_file, target_file))
+                    self.pair_scenes.append(scene)  # 存储场景前缀
+                    pair_count += 1
+        
+        print(f"加载点云对总数: {pair_count}")
+        
+    def get_scene_indices(self, scene_names):
+        """获取指定场景的所有样本索引"""
+        indices = []
+        for i, scene in enumerate(self.pair_scenes):
+            if scene in scene_names:
+                indices.append(i)
+        return indices
+
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        source_file, target_file = self.pairs[idx]
+        
+        # 读取源和目标点云
+        source = plyread(source_file)
+        target = plyread(target_file)
+        
+        # 应用变换
+        if self.transform:
+            source = self.transform(source)
+            target = self.transform(target)
+        
+        # 创建默认变换矩阵
+        igt = torch.eye(4)
+        
+        return source, target, igt
+
+
+class C3VDset4tracking(torch.utils.data.Dataset):
+    """C3VD跟踪数据集"""
+    def __init__(self, dataset, num_points, mag=0.8):
+        self.dataset = dataset
+        self.num_points = num_points
+        self.mag = mag  # 添加扰动幅度参数
+        self.transf = RandomTransformSE3(mag=self.mag)  # 创建随机变换
+        self.resampler = Resampler(num_points)
+        
+    def __len__(self):
+        return len(self.dataset)
+        
+    def __getitem__(self, idx):
+        # 获取源和目标点云
+        source, target, _ = self.dataset[idx]
+        
+        # 移除无效点并重采样
+        source = source[torch.isfinite(source).all(dim=1)]
+        target = target[torch.isfinite(target).all(dim=1)]
+        source = self.resampler(source)
+        target = self.resampler(target)
+        
+        # 归一化
+        combined = torch.cat([source, target], dim=0)
+        min_vals = combined.min(dim=0)[0]
+        max_vals = combined.max(dim=0)[0]
+        center = (min_vals + max_vals) / 2
+        scale = (max_vals - min_vals).max()
+        source_norm = (source - center) / scale
+        target_norm = (target - center) / scale
+        
+        # 生成随机变换
+        x = self.transf.generate_transform()
+        
+        # 应用变换
+        source_perturbed = self.transf.apply_transform(source_norm, x)
+        
+        # 获取变换矩阵 - 修改这里，添加squeeze(0)以匹配PointRegistration
+        igt = self.transf.igt.squeeze(0)  # 添加squeeze(0)
+        
+        return target_norm, source_perturbed, igt
+
+
+class C3VDset4testing(torch.utils.data.Dataset):
+    """专门用于C3VD测试的数据集类，支持应用外部扰动"""
+    def __init__(self, dataset, num_points, pose_file=None):
+        self.dataset = dataset
+        self.num_points = num_points
+        self.pose_file = pose_file
+        self.resampler = Resampler(num_points)
+        
+        # 加载姿态文件中的变换矩阵
+        if pose_file and os.path.exists(pose_file):
+            print(f"正在从 {pose_file} 加载测试扰动...")
+            self.transformations = load_pose(pose_file)
+            print(f"成功加载 {len(self.transformations)} 个扰动变换")
+        else:
+            if pose_file:
+                print(f"警告: 找不到姿态文件 {pose_file}")
+            self.transformations = None
+            
+        self.cloud_info = {}
+        
+    def __len__(self):
+        return len(self.dataset)
+        
+    def apply_transform(self, p0, x):
+        # p0: [N, 3]
+        # x: [1, 6], twist params
+        g = utils.exp(x).to(p0)   # [1, 4, 4]
+        p1 = utils.transform(g, p0)
+        return p1
+
+    def __getitem__(self, idx):
+        # 获取源和目标点云
+        source, target, _ = self.dataset[idx]
+        
+        # 移除无效点
+        source = source[torch.isfinite(source).all(dim=1)]
+        target = target[torch.isfinite(target).all(dim=1)]
+        
+        # 重采样点云
+        source = self.resampler(source)
+        target = self.resampler(target)
+        
+        # 联合归一化
+        combined = torch.cat([source, target], dim=0)
+        min_vals = combined.min(dim=0)[0]
+        max_vals = combined.max(dim=0)[0]
+        center = (min_vals + max_vals) / 2
+        scale = (max_vals - min_vals).max()
+                
+        # 应用归一化
+        source_norm = (source - center) / scale
+        target_norm = (target - center) / scale
+        
+        # 默认恒等变换
+        igt = torch.eye(4, device=source_norm.device, dtype=source_norm.dtype)
+        
+        # 应用扰动变换（如果有）
+        if self.transformations is not None and idx < len(self.transformations):
+            perturbation_np = self.transformations[idx]
+            perturbation_vec = torch.from_numpy(perturbation_np).float().unsqueeze(0).to(source_norm.device)
+            
+            # 应用扰动到源点云
+            source_transformed = self.apply_transform(source_norm, perturbation_vec)
+            source_norm = source_transformed
+            
+            # 计算变换矩阵
+            igt = utils.exp(perturbation_vec).squeeze(0)
+            
+        # 存储点云信息用于调试
+        self.cloud_info[idx] = {
+            'original_source': source.clone(),
+            'original_target': target.clone(),
+            'normalized_source': source_norm.clone(),
+            'normalized_target': target_norm.clone(),
+            'igt': igt.clone()
+        }
+        
+        # 返回(模板，源，变换矩阵)
+        return target_norm, source_norm, igt
 
 
 def load_3dmatch_batch_data(p0_fi, p1_fi, voxel_ratio):
