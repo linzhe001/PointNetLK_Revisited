@@ -181,7 +181,7 @@ class AnalyticalPointNetLK(torch.nn.Module):
         dg = self.exp(dx)
         return dg.matmul(g.float())
 
-    def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic', mamba_in=None, mamba_out=None, extra_param_0=None):
+    def Cal_Jac(self, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, num_points, p0, mode, voxel_coords_diff=None, data_type='synthetic', mamba_in=None, mamba_out=None, extra_param_0=None, ssm_data=None):
         """
         调用特征提取器的get_jacobian方法计算雅可比矩阵
         """
@@ -275,6 +275,66 @@ class AnalyticalPointNetLK(torch.nn.Module):
                 num_points=num_points,
                 extra_param_0=extra_param_0
             )
+        elif self.extractor_type == "swinattention_v1":
+            # Swin Attention V1特征提取器
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points,
+                extra_param_0=extra_param_0
+            )
+        elif self.extractor_type == "swinattention_v2":
+            # Swin Attention V2特征提取器
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points,
+                extra_param_0=extra_param_0
+            )
+        elif self.extractor_type == "ssm_v1":
+            # SSM V1特征提取器
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points,
+                ssm_data=ssm_data
+            )
+        elif self.extractor_type == "ssm_v2":
+            # SSM V2特征提取器
+            return self.ptnet.get_jacobian(
+                p0=p0, 
+                mask_fn=Mask_fn, 
+                a_fn=A_fn, 
+                ax_fn=Ax_fn, 
+                bn_fn=BN_fn, 
+                max_idx=max_idx, 
+                mode=mode,
+                voxel_coords_diff=voxel_coords_diff,
+                data_type=data_type,
+                num_points=num_points,
+                ssm_data=ssm_data
+            )
         else:
             raise ValueError(f"不支持的特征提取器类型: {self.extractor_type}")
 
@@ -339,6 +399,26 @@ class AnalyticalPointNetLK(torch.nn.Module):
                 J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
                               num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
                               data_type=data_type, extra_param_0=fpt_data)
+            elif self.extractor_type == "swinattention_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, attn_info = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type, extra_param_0=attn_info)
+            elif self.extractor_type == "swinattention_v2":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, attn_info = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type, extra_param_0=attn_info)
+            elif self.extractor_type == "ssm_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, ssm_data = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type, ssm_data=ssm_data)
+            elif self.extractor_type == "ssm_v2":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, ssm_data = self.ptnet(p0, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_points, p0, mode, voxel_coords_diff=voxel_coords_diff, 
+                              data_type=data_type, ssm_data=ssm_data)
         else:
             if num_points >= num_random_points:
                 random_idx = np.random.choice(num_points, num_random_points, replace=False)
@@ -380,6 +460,30 @@ class AnalyticalPointNetLK(torch.nn.Module):
                              num_random_points, random_points, mode, 
                              voxel_coords_diff=None, data_type=data_type,
                              extra_param_0=fpt_data)
+            elif self.extractor_type == "swinattention_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, attn_info = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_random_points, random_points, mode, 
+                              voxel_coords_diff=None, data_type=data_type,
+                              extra_param_0=attn_info)
+            elif self.extractor_type == "swinattention_v2":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, attn_info = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_random_points, random_points, mode, 
+                              voxel_coords_diff=None, data_type=data_type,
+                              extra_param_0=attn_info)
+            elif self.extractor_type == "ssm_v1":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, ssm_data = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_random_points, random_points, mode, 
+                              voxel_coords_diff=None, data_type=data_type,
+                              ssm_data=ssm_data)
+            elif self.extractor_type == "ssm_v2":
+                f0, Mask_fn, A_fn, Ax_fn, BN_fn, max_idx, ssm_data = self.ptnet(random_points, -1)
+                J = self.Cal_Jac(Mask_fn, A_fn, Ax_fn, BN_fn, max_idx,
+                              num_random_points, random_points, mode, 
+                              voxel_coords_diff=None, data_type=data_type,
+                              ssm_data=ssm_data)
 
         # compute psuedo inverse of the Jacobian to solve delta(xi)
         Jt = J.transpose(1, 2)   # [B, 6, K]

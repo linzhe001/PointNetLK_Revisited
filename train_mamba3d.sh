@@ -14,7 +14,7 @@ LEARNING_RATE=1e-5
 DECAY_RATE=1e-4
 WARMUP_EPOCHS=5
 MIN_LR=1e-8
-EMBEDDING="fastpointtransformer_v2"
+EMBEDDING="ssm_v2"
 DIM_K=1024  # 确保这个维度与特征提取器匹配
 MAX_ITER=10
 
