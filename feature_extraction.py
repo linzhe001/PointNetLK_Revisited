@@ -40,7 +40,7 @@ class FeatureExtractor(nn.Module):
         raise NotImplementedError("子类必须实现forward方法")
     
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mode="train", 
-                     voxel_coords_diff=None, data_type='synthetic', num_points=None):
+                     voxel_coords_diff=None, data_type='synthetic', num_points=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -52,11 +52,130 @@ class FeatureExtractor(nn.Module):
             voxel_coords_diff: 体素坐标差异（用于真实数据）
             data_type: 数据类型（'synthetic'或'real'）
             num_points: 点云中的点数量
+            use_numerical: 是否使用数值近似方法
+            delta: 数值微分的步长
             
         返回:
             雅可比矩阵 [B,K,6]
         """
-        raise NotImplementedError("子类必须实现get_jacobian方法")
+        # 如果选择使用数值近似方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 否则使用解析方法
+        if num_points is None:
+            num_points = p0.shape[1]
+        batch_size = p0.shape[0]
+        dim_k = self.dim_k
+        device = p0.device
+        
+        # 1. 计算变形雅可比矩阵
+        g_ = torch.zeros(batch_size, 6).to(device)
+        warp_jac = utils.compute_warp_jac(g_, p0, num_points)   # B x N x 3 x 6
+        
+        # 2. 计算特征雅可比矩阵
+        feature_j = feature_jac(mask_fn, a_fn, ax_fn, bn_fn, device).to(device)
+        #feature_j = feature_jac_auto_diff(p0, self, device).to(device)
+        feature_j = feature_j.permute(0, 3, 1, 2)   # B x N x 6 x K
+        
+        # 3. 组合得到最终雅可比矩阵
+        J_ = torch.einsum('ijkl,ijkm->ijlm', feature_j, warp_jac)   # B x N x K x 6
+        
+        # 4. 根据最大池化索引进行处理
+        jac_max = J_.permute(0, 2, 1, 3)   # B x K x N x 6
+        jac_max_ = []
+        
+        for i in range(batch_size):
+            jac_max_t = jac_max[i, torch.arange(dim_k), max_idx[i]]
+            jac_max_.append(jac_max_t)
+        jac_max_ = torch.cat(jac_max_)
+        J_ = jac_max_.reshape(batch_size, dim_k, 6)   # B x K x 6
+        
+        if len(J_.size()) < 3:
+            J = J_.unsqueeze(0)
+        else:
+            J = J_
+        
+        # 处理真实数据的特殊情况
+        if mode == 'test' and data_type == 'real':
+            J_ = J_.permute(1, 0, 2).reshape(dim_k, -1)   # K x (V6)
+            
+            # 计算条件变形雅可比矩阵
+            warp_condition = utils.cal_conditioned_warp_jacobian(voxel_coords_diff)   # V x 6 x 6
+            warp_condition = warp_condition.permute(0,2,1).reshape(-1, 6)   # (V6) x 6
+
+            J = torch.einsum('ij,jk->ik', J_, warp_condition).unsqueeze(0)   # 1 X K X 6
+            
+        return J
+    
+    def get_jacobian_numerical(self, p0, delta=1.0e-3, mode="train", 
+                              voxel_coords_diff=None, data_type='synthetic', num_points=None):
+        """
+        使用数值近似方法计算特征提取的雅可比矩阵
+        
+        参数:
+            p0: 输入点云 [B,N,3]
+            delta: 数值微分的步长
+            mode: 训练或测试模式
+            voxel_coords_diff: 体素坐标差异（用于真实数据）
+            data_type: 数据类型（'synthetic'或'real'）
+            num_points: 点云中的点数量
+            
+        返回:
+            雅可比矩阵 [B,K,6]
+        """
+        if num_points is None:
+            num_points = p0.shape[1]
+        batch_size = p0.shape[0]
+        dim_k = self.dim_k
+        device = p0.device
+        
+        # 保存模型的训练状态并切换到评估模式
+        training = self.training
+        self.eval()
+        
+        try:
+            # 计算原始特征
+            f0 = self.forward(p0, iter=0)  # [B, K]
+            
+            # 创建扰动参数
+            dt = torch.ones(batch_size, 6, device=device, dtype=p0.dtype) * delta
+            
+            # 计算6个扰动的变换矩阵
+            transf = torch.zeros(batch_size, 6, 4, 4, device=device, dtype=p0.dtype)
+            for b in range(batch_size):
+                d = torch.diag(dt[b, :])  # [6, 6]
+                D = utils.exp(-d)  # [6, 4, 4]
+                transf[b, :, :, :] = D[:, :, :]
+            
+            # 应用变换到点云
+            transf = transf.unsqueeze(2)  # [B, 6, 1, 4, 4]
+            p_perturbed = utils.transform(transf, p0.unsqueeze(1))  # [B, 6, N, 3]
+            
+            # 计算扰动后的特征
+            p_reshaped = p_perturbed.view(-1, num_points, 3)  # [B*6, N, 3]
+            f_perturbed = self.forward(p_reshaped, iter=0)  # [B*6, K]
+            f_perturbed = f_perturbed.view(batch_size, 6, -1).transpose(1, 2)  # [B, K, 6]
+            
+            # 计算特征差分
+            f0_expanded = f0.unsqueeze(-1)  # [B, K, 1]
+            df = f0_expanded - f_perturbed  # [B, K, 6]
+            
+            # 计算雅可比矩阵
+            J = df / dt.unsqueeze(1)  # [B, K, 6]
+            
+            # 处理真实数据的特殊情况
+            if mode == 'test' and data_type == 'real' and voxel_coords_diff is not None:
+                J_ = J.permute(1, 0, 2).reshape(dim_k, -1)  # K x (V6)
+                warp_condition = utils.cal_conditioned_warp_jacobian(voxel_coords_diff)  # V x 6 x 6
+                warp_condition = warp_condition.permute(0, 2, 1).reshape(-1, 6)  # (V6) x 6
+                J = torch.einsum('ij,jk->ik', J_, warp_condition).unsqueeze(0)  # 1 X K X 6
+                
+            return J
+            
+        finally:
+            # 恢复模型的训练状态
+            self.train(training)
 
 
 #### original model using PointNet ####
@@ -161,7 +280,7 @@ class Pointnet_Features(FeatureExtractor):
             return x
     
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mode="train", 
-                     voxel_coords_diff=None, data_type='synthetic', num_points=None):
+                     voxel_coords_diff=None, data_type='synthetic', num_points=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -173,10 +292,17 @@ class Pointnet_Features(FeatureExtractor):
             voxel_coords_diff: 体素坐标差异（用于真实数据）
             data_type: 数据类型（'synthetic'或'real'）
             num_points: 点云中的点数量
+            use_numerical: 是否使用数值近似方法
+            delta: 数值微分的步长
             
         返回:
             雅可比矩阵 [B,K,6]
         """
+        # 如果选择使用数值近似方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 否则使用解析方法
         if num_points is None:
             num_points = p0.shape[1]
         batch_size = p0.shape[0]
@@ -484,7 +610,7 @@ class Mamba3D_Features(FeatureExtractor):
             x = x.view(x.size(0), -1)
             return x
     
-    def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mamba_in=None, mamba_out=None, mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None):
+    def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mamba_in=None, mamba_out=None, mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -498,10 +624,17 @@ class Mamba3D_Features(FeatureExtractor):
             voxel_coords_diff: 体素坐标差异（用于真实数据）
             data_type: 数据类型（'synthetic'或'real'）
             num_points: 点云中的点数量
+            use_numerical: 是否使用数值近似方法
+            delta: 数值微分的步长
             
         返回:
             雅可比矩阵 [B,K,6]
         """
+        # 如果选择使用数值近似方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 否则使用解析方法
         if num_points is None:
             num_points = p0.shape[1]
         batch_size = p0.shape[0]
@@ -741,7 +874,7 @@ class Mamba3D_V2_Features(FeatureExtractor):
     
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
                     bissm_in=None, bissm_out=None, mode="train", 
-                    voxel_coords_diff=None, data_type='synthetic', num_points=None):
+                    voxel_coords_diff=None, data_type='synthetic', num_points=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -755,10 +888,17 @@ class Mamba3D_V2_Features(FeatureExtractor):
             voxel_coords_diff: 体素坐标差异（用于真实数据）
             data_type: 数据类型（'synthetic'或'real'）
             num_points: 点云中的点数量
+            use_numerical: 是否使用数值近似方法
+            delta: 数值微分的步长
             
         返回:
             雅可比矩阵 [B,K,6]
         """
+        # 如果选择使用数值近似方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 否则使用解析方法
         if num_points is None:
             num_points = p0.shape[1]
         batch_size = p0.shape[0]
@@ -1049,10 +1189,15 @@ class Pointnet_Attention_Features(FeatureExtractor):
             
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None,
                      mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None,
-                     extra_param_0=None):
+                     extra_param_0=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         """
+        # 如果选择使用数值近似方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 否则使用解析方法
         if num_points is None:
             num_points = p0.shape[1]
         batch_size = p0.shape[0]
@@ -1328,7 +1473,7 @@ class FastPointTransformer_Features(FeatureExtractor):
             return x
     
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, mode="train", 
-                    voxel_coords_diff=None, data_type='synthetic', num_points=None, **kwargs):
+                    voxel_coords_diff=None, data_type='synthetic', num_points=None, use_numerical=False, delta=1.0e-3, **kwargs):
         """
         计算特征提取的雅可比矩阵
         
@@ -1343,11 +1488,18 @@ class FastPointTransformer_Features(FeatureExtractor):
             voxel_coords_diff: 体素坐标差异（用于真实数据）
             data_type: 数据类型（'synthetic'或'real'）
             num_points: 点云中的点数量
+            use_numerical: 是否使用数值近似方法
+            delta: 数值微分的步长
             **kwargs: 额外参数，支持扩展
             
         返回:
             雅可比矩阵 [B,K,6]
         """
+        # 如果选择使用数值近似方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 否则使用解析方法
         if num_points is None:
             num_points = p0.shape[1]
         batch_size = p0.shape[0]
@@ -1665,7 +1817,7 @@ class Pointnet_fastpointtransformer_v2(FeatureExtractor):
             
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
                      mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None,
-                     extra_param_0=None):
+                     extra_param_0=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -1969,7 +2121,7 @@ class Pointnet_SwinAttention_Features(FeatureExtractor):
     
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
                      mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None, 
-                     extra_param_0=None):
+                     extra_param_0=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -1985,10 +2137,17 @@ class Pointnet_SwinAttention_Features(FeatureExtractor):
             data_type: 数据类型 ('synthetic' 或 'real')
             num_points: 点数量
             extra_param_0: Swin Attention相关信息
+            use_numerical: 是否使用数值近似方法
+            delta: 数值微分的步长
         
         返回:
             雅可比矩阵 [B,K,6]
         """
+        # 如果使用数值方法，调用基类的数值计算方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 原有的解析方法
         if num_points is None:
             num_points = p0.shape[1]
         batch_size = p0.shape[0]
@@ -2354,7 +2513,7 @@ class Pointnet_SwinAttention_V2_Features(FeatureExtractor):
             
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
                      mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None, 
-                     extra_param_0=None):
+                     extra_param_0=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -2367,8 +2526,8 @@ class Pointnet_SwinAttention_V2_Features(FeatureExtractor):
             max_idx: 最大池化索引
             mode: 模式，"train"或"test"
             voxel_coords_diff: 体素坐标差分
-            data_type: 数据类型，"synthetic"或"real"
-            num_points: 点云中的点数
+            data_type: 数据类型 ('synthetic' 或 'real')
+            num_points: 点数量
             extra_param_0: Swin Attention相关信息
         
         返回:
@@ -2658,7 +2817,7 @@ class SSM_Features_v1(FeatureExtractor):
             
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
                     mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None, 
-                    ssm_data=None):
+                    ssm_data=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -2674,10 +2833,17 @@ class SSM_Features_v1(FeatureExtractor):
             data_type: 数据类型
             num_points: 点云数量
             ssm_data: SSM数据（包含输入、输出和实例）
+            use_numerical: 是否使用数值方法计算雅可比矩阵
+            delta: 数值方法的扰动参数
             
         返回:
             雅可比矩阵 [B,K,6]
         """
+        # 如果使用数值方法，调用基类的数值计算方法
+        if use_numerical:
+            return self.get_jacobian_numerical(p0, delta, mode, voxel_coords_diff, data_type, num_points)
+        
+        # 原有的解析方法
         if num_points is None:
             num_points = p0.shape[1]
         batch_size = p0.shape[0]
@@ -3059,7 +3225,7 @@ class SSM_Features_v2(FeatureExtractor):
     
     def get_jacobian(self, p0, mask_fn=None, a_fn=None, ax_fn=None, bn_fn=None, max_idx=None, 
                     mode="train", voxel_coords_diff=None, data_type='synthetic', num_points=None, 
-                    ssm_data=None):
+                    ssm_data=None, use_numerical=False, delta=1.0e-3):
         """
         计算特征提取的雅可比矩阵
         
@@ -3075,6 +3241,8 @@ class SSM_Features_v2(FeatureExtractor):
             data_type: 数据类型，'synthetic'或'real'
             num_points: 点数量
             ssm_data: SSM特定数据
+            use_numerical: 是否使用数值方法计算雅可比矩阵
+            delta: 数值方法的扰动参数
             
         返回:
             雅可比矩阵 [B,K,6]

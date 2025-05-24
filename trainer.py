@@ -31,6 +31,10 @@ class TrainerAnalyticalPointNetLK:
         self.embedding = args.embedding
         self.filename = args.outfile
         
+        # 数值近似法参数
+        self.use_numerical = getattr(args, 'use_approx', False)
+        self.delta = getattr(args, 'delta', 1.0e-3)
+        
     def create_features(self):
         """
         创建特征提取网络
@@ -170,10 +174,10 @@ class TrainerAnalyticalPointNetLK:
             for j in range(start_idx, end_idx):
                 if data_type == 'real':
                     _ = model.AnalyticalPointNetLK.do_forward(ptnetlk, voxel_features_p0, voxel_coords_p0,
-                                voxel_features_p1, voxel_coords_p1, j, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type)
+                                voxel_features_p1, voxel_coords_p1, j, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type, use_numerical=self.use_numerical, delta=self.delta)
                 else:
                     _ = model.AnalyticalPointNetLK.do_forward(ptnetlk, p0, None,
-                                p1, None, j, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type)
+                                p1, None, j, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type, use_numerical=self.use_numerical, delta=self.delta)
 
                 estimated_pose = ptnetlk.g
 
@@ -253,7 +257,7 @@ class TrainerAnalyticalPointNetLK:
             p1 = p1.to(self.device)
             gt_pose = gt_pose.to(device)
             r = model.AnalyticalPointNetLK.do_forward(ptnetlk, p0, None,
-                                p1, None, self.max_iter, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type, num_random_points)
+                                p1, None, self.max_iter, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type, num_random_points, use_numerical=self.use_numerical, delta=self.delta)
         else:
             # 2. voxelization
             voxel_features_p0, voxel_coords_p0, voxel_features_p1, voxel_coords_p1, gt_pose = data
@@ -264,7 +268,7 @@ class TrainerAnalyticalPointNetLK:
             gt_pose = gt_pose.reshape(-1, gt_pose.shape[2], gt_pose.shape[3]).to(device)
             
             r = model.AnalyticalPointNetLK.do_forward(ptnetlk, voxel_features_p0, voxel_coords_p0,
-                    voxel_features_p1, voxel_coords_p1, self.max_iter, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type, num_random_points)
+                    voxel_features_p1, voxel_coords_p1, self.max_iter, self.xtol, self.p0_zero_mean, self.p1_zero_mean, mode, data_type, num_random_points, use_numerical=self.use_numerical, delta=self.delta)
 
         estimated_pose = ptnetlk.g
 

@@ -94,6 +94,12 @@ def options(argv=None):
     parser.add_argument('--test-scenes', type=str, default='',
                        help='指定测试场景，用逗号分隔场景名称，如"sigmoid,cecum"')
 
+    # 数值近似法参数
+    parser.add_argument('--use-approx', action='store_true',
+                       help='使用数值近似方法计算雅可比矩阵')
+    parser.add_argument('--delta', type=float, default=1.0e-3,
+                       metavar='D', help='数值近似方法的扰动参数')
+
     args = parser.parse_args(argv)
     return args
 
